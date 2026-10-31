@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MediAssistRover Full Human AI</title>
+<style>
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  width: 100vw;
+  background: #0b1220;
+  color: #f1f5f9;
+  font-family: Arial, sans-serif;
+  overflow: hidden;
+}
+body {
+  padding: 10px 16px;
+  display: flex;
+  flex-direction: column;
+}
+.header-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #1e293b;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+.header-bar h1 {
+  font-size: 18px;
+  margin: 0;
+  color: #38bdf8;
+  letter-spacing: 0.5px;
+}
+.header-bar small {
+  color: #94a3b8;
+  font-size: 12px;
+}
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(340px, 1fr);
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+}
+main, aside {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+main::-webkit-scrollbar, aside::-webkit-scrollbar {
+  width: 6px;
+}
+main::-webkit-scrollbar-thumb, aside::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+.card {
+  background: #172238;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.card h2 {
+  font-size: 14px;
+  margin: 0;
+  color: #93c5fd;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+p {
+  margin: 4px 0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+/* Tiêu đề & thanh công cụ phóng to/thu nhỏ */
+.card-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  padding: 3px 8px;
+  border-radius: 6px;
+}
+.zoom-label {
+  font-size: 11px;
+  color: #94a3b8;
+}
+.zoom-badge {
+  font-size: 11px;
+  font-weight: bold;
+  color: #38bdf8;
+  min-width: 32px;
+  text-align: center;
+}
+.btn-zoom, .btn-preset {
+  background: #1e293b;
+  color: #f1f5f9;
+  border: 1px solid #475569;
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+.btn-zoom:hover, .btn-preset:hover {
+  background: #38bdf8;
+  color: #0b1220;
+  border-color: #38bdf8;
+}
+.btn-zoom:active, .btn-preset:active {
+  transform: scale(0.95);
+}
+#zoomSlider {
+  width: 80px;
+  height: 4px;
+  accent-color: #38bdf8;
+  cursor: pointer;
+}
+
+/* Khung video linh hoạt tùy chỉnh to nhỏ */
+.camera-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: #060a12;
+  border-radius: 8px;
+  height: 52vh;
+  max-height: 520px;
+  min-height: 200px;
+  overflow: hidden;
+  border: 1px solid #1e293b;
+  transition: height 0.15s ease, max-height 0.15s ease;
+}
+#camera {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  display: block;
+}
+
+/* Thanh trạng thái gọn ngay dưới camera */
+.camera-status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  justify-content: space-between;
+  align-items: center;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin-top: 8px;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.stat {
+  background: #1e293b;
+  border-radius: 6px;
+  padding: 8px 10px;
+  flex: 1;
+  min-width: 70px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+.stat strong {
+  display: block;
+  font-size: 16px;
+  margin-top: 2px;
+  color: #f1f5f9;
+}
+.green { color: #4ade80; }
+.red { color: #fb7185; }
+.yellow { color: #fde047; }
+
+pre {
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 180px;
+  overflow-y: auto;
+  background: #0f172a;
+  padding: 8px;
+  border-radius: 6px;
+  margin: 6px 0 0;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+th, td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid #334155;
+}
+summary {
+  cursor: pointer;
+  padding: 6px 0;
+  font-size: 12px;
+  color: #38bdf8;
+}
+
+@media(max-width: 960px) {
+  html, body {
+    overflow: auto;
+    height: auto;
+  }
+  .layout {
+    grid-template-columns: 1fr;
+  }
+  .camera-container {
+    height: 45vh;
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="header-bar">
+  <h1>MediAssistRover — Full Human AI Tracking</h1>
+  <small>MediaPipe Pose 33 · Hands 21 · Face 478 · Fall Detection v2</small>
+</div>
+
+<div class="layout">
+  <main>
+    <div class="card">
+      <div class="card-header-row">
+        <h2>Camera AI Realtime</h2>
+        <div class="zoom-controls">
+          <span class="zoom-label">Kích thước:</span>
+          <button type="button" class="btn-zoom" onclick="changeZoom(-5)" title="Thu nhỏ">−</button>
+          <input type="range" id="zoomSlider" min="25" max="85" value="52" step="1" oninput="setZoom(this.value)">
+          <button type="button" class="btn-zoom" onclick="changeZoom(5)" title="Phóng to">+</button>
+          <span id="zoomPercent" class="zoom-badge">52%</span>
+          <button type="button" class="btn-preset" onclick="setZoom(35)" title="Thu nhỏ">35%</button>
+          <button type="button" class="btn-preset" onclick="setZoom(52)" title="Vừa màn hình laptop (Mặc định)">Vừa</button>
+          <button type="button" class="btn-preset" onclick="setZoom(75)" title="Phóng to">Lớn</button>
+          <button type="button" class="btn-preset" onclick="toggleFullscreen()" title="Toàn màn hình">⛶</button>
+        </div>
+      </div>
+
+      <div class="camera-container" id="cameraBox">
+        <img id="camera" src="/video" alt="Camera AI">
+      </div>
+
+      <div class="camera-status-bar">
+        <div>AI: <strong id="status" class="green">Đang kết nối...</strong></div>
+        <div>Nghi ngã: <strong id="fall">—</strong></div>
+        <div id="alert" class="yellow">Chưa ghi nhận cảnh báo</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-bottom:8px;">Thống kê nhận diện</h2>
+      <div class="stats">
+        <div class="stat">FPS<strong id="fps">0</strong></div>
+        <div class="stat">Body<strong id="bodyCount">0/33</strong></div>
+        <div class="stat">Hands<strong id="handCount">0/2</strong></div>
+        <div class="stat">Face<strong id="faceCount">0/478</strong></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-bottom:8px;">Phân tích khuôn mặt</h2>
+      <p id="actions">Chưa nhận diện khuôn mặt.</p>
+      <p id="head"></p>
+
+      <details id="faceDetails">
+        <summary>Xem 52 hệ số chuyển động khuôn mặt</summary>
+        <pre id="blendshapes"></pre>
+      </details>
+
+      <details id="facePointsDetails">
+        <summary>Xem 478 tọa độ khuôn mặt</summary>
+        <pre id="facePoints"></pre>
+      </details>
+    </div>
+  </main>
+
+  <aside>
+    <div class="card" id="sosCard">
+      <h2 style="margin-bottom:8px;">Signal for Help — SOS quốc tế (TEST)</h2>
+      <p>Trạng thái: <strong id="sosPhase">Đang chờ</strong></p>
+      <p id="sosInstruction">Xòe bàn tay hướng camera</p>
+      <p id="sosHand">Bàn tay: ?</p>
+      <p id="sosRemaining"></p>
+      <div id="sosAlert" style="
+        display:none;
+        padding:10px;
+        margin-top:8px;
+        background:#7f1d1d;
+        color:white;
+        border-radius:6px;
+        font-weight:bold;
+        font-size:13px;">
+        SOS DETECTED — YÊU CẦU HỖ TRỢ
+      </div>
+      <pre id="sosEvent">Chưa có sự kiện</pre>
+      <small style="color:#94a3b8; font-size:11px;">Chế độ thử nghiệm local.</small>
+    </div>
+
+    <div class="card" id="seizureCard">
+      <h2 style="margin-bottom:8px;">Phát hiện chuyển động nghi co giật — DEMO</h2>
+      <p>Trạng thái: <strong id="seizurePhase">Đang khởi động...</strong></p>
+      <p id="seizureExplanation" style="color:#94a3b8; font-size:12px;">Phân tích dao động hai cánh tay trong cửa sổ 6 giây.</p>
+      <p>FPS: <strong id="seizureFPS">—</strong></p>
+      <p id="seizureLastEvent" style="font-size:12px;">Chưa ghi nhận sự kiện.</p>
+      <details><summary>Chỉ số dao động cánh tay</summary>
+        <pre id="seizureMetrics"></pre>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-bottom:8px;">Theo dõi từng ngón tay</h2>
+      <div id="hands">Chưa nhận diện bàn tay.</div>
+      <details id="handPointsDetails">
+        <summary>Xem 21 điểm mỗi bàn tay</summary>
+        <pre id="handPoints"></pre>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-bottom:8px;">Khung xương cơ thể</h2>
+      <details id="bodyDetails">
+        <summary>Xem 33 điểm X/Y/Z</summary>
+        <pre id="bodyPoints"></pre>
+      </details>
+    </div>
+  </aside>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// ==========================================
+// ĐIỀU CHỈNH PHÓNG TO / THU NHỎ MÀN HÌNH TÙY Ý
+// ==========================================
+function setZoom(val) {
+  val = Math.max(25, Math.min(88, parseInt(val)));
+  const box = document.getElementById("cameraBox");
+  const slider = document.getElementById("zoomSlider");
+  const badge = document.getElementById("zoomPercent");
+  if (box) {
+    box.style.height = val + "vh";
+    box.style.maxHeight = (val * 10) + "px";
+  }
+  if (slider) slider.value = val;
+  if (badge) badge.textContent = val + "%";
+  localStorage.setItem("mar_zoom_level", val);
+}
+
+function changeZoom(delta) {
+  const slider = document.getElementById("zoomSlider");
+  const current = slider ? parseInt(slider.value) : 52;
+  setZoom(current + delta);
+}
+
+function toggleFullscreen() {
+  const box = document.getElementById("cameraBox");
+  if (!document.fullscreenElement) {
+    if (box.requestFullscreen) box.requestFullscreen();
+    else if (box.webkitRequestFullscreen) box.webkitRequestFullscreen();
+  } else {
+    if (document.exitFullscreen) document.exitFullscreen();
+  }
+}
+
+// Khôi phục kích thước người dùng đã lưu
+window.addEventListener("DOMContentLoaded", () => {
+  const saved = localStorage.getItem("mar_zoom_level");
+  if (saved) setZoom(saved);
+});
+
+// ==========================================
+// CÁC HÀM XỬ LÝ DỮ LIỆU AI HIỂN THỊ
+// ==========================================
+const actionNames = {
+  BOTH_EYES_CLOSED: "Nhắm cả hai mắt",
+  LEFT_EYE_BLINK: "Mắt trái nhắm/chớp",
+  RIGHT_EYE_BLINK: "Mắt phải nhắm/chớp",
+  MOUTH_OPEN: "Há miệng",
+  SMILE: "Cười",
+  BROWS_RAISED: "Nhướng lông mày",
+  BROWS_DOWN: "Cau mày",
+  LIPS_PUCKER: "Chu môi",
+  CHEEK_PUFF: "Phồng má",
+  EYES_WIDE: "Mở to mắt",
+  NOSE_SNEER: "Nhăn mũi"
+};
+
+const fingerNames = {
+  thumb: "Ngón cái",
+  index: "Ngón trỏ",
+  middle: "Ngón giữa",
+  ring: "Ngón áp út",
+  pinky: "Ngón út"
+};
+
+const stateNames = {
+  OPEN: "Duỗi",
+  BENT: "Co",
+  PARTIAL: "Co một phần"
+};
+
+function onData(data) {
+  $("status").textContent = data.status || "—";
+  $("fps").textContent = data.fps ?? 0;
+
+  const pCount = data.people_count ?? (data.people?.length || (data.body?.length ? 1 : 0));
+  const pList = data.people || [];
+  if (pList.length > 0) {
+    const listStr = pList.map(p => `#${p.person_id}: ${p.state}`).join(" | ");
+    $("bodyCount").textContent = `${pCount} người (${listStr})`;
+  } else {
+    $("bodyCount").textContent = `${pCount} người`;
+  }
+  $("handCount").textContent = `${data.hands?.length || 0}/2`;
+  $("faceCount").textContent = `${data.face?.landmarks?.length || 0}/478`;
+
+  if (data.fall_state === "SUSPECTED_FALL") {
+    $("fall").textContent = "NGHI TÉ NGÃ ⚠️";
+    $("fall").className = "red";
+    $("alert").textContent = "CẢNH BÁO: PHÁT HIỆN NGƯỜI TÉ NGÃ!";
+    $("alert").className = "red";
+  } else if (data.fall_state === "CHECKING") {
+    $("fall").textContent = "Đang kiểm tra va chạm...";
+    $("fall").className = "yellow";
+    $("alert").textContent = "Đang theo dõi tư thế nằm...";
+    $("alert").className = "yellow";
+  } else {
+    $("fall").textContent = data.fall_state ? data.fall_state.replace(/_/g, " ") : "—";
+    $("fall").className = "green";
+    $("alert").textContent = pCount > 0 ? `Bình thường (${pCount} người trong khung hình)` : "Chưa thấy người";
+    $("alert").className = pCount > 0 ? "green" : "yellow";
+  }
+
+  if (data.face) {
+    const actions = data.face.actions || [];
+    $("actions").textContent = actions.length
+      ? actions.map(a => `${actionNames[a.name] || a.name} (${a.score})`).join(" · ")
+      : "Có khuôn mặt — chưa có động tác vượt ngưỡng.";
+
+    const h = data.face.head;
+    $("head").textContent = h
+      ? `Hướng đầu: Pitch ${h.pitch_deg}°, Yaw ${h.yaw_deg}°, Roll ${h.roll_deg}°`
+      : "";
+
+    if ($("faceDetails").open) {
+      $("blendshapes").textContent = JSON.stringify(data.face.blendshapes, null, 2);
+    }
+    if ($("facePointsDetails").open) {
+      $("facePoints").textContent = JSON.stringify(data.face.landmarks, null, 2);
+    }
+  } else {
+    $("actions").textContent = "Chưa nhận diện khuôn mặt.";
+    $("head").textContent = "";
+  }
+
+  if (data.hands?.length) {
+    $("hands").innerHTML = data.hands.map(hand => {
+      const rows = Object.entries(hand.fingers)
+        .map(([name, info]) =>
+          `<tr><td>${fingerNames[name]}</td>` +
+          `<td>${stateNames[info.state]}</td>` +
+          `<td>${info.angle}°</td></tr>`
+        ).join("");
+
+      return `
+        <p><strong>${hand.hand === "Left" ? "Tay trái" : "Tay phải"}</strong> — Cử chỉ: ${hand.gesture}</p>
+        <table>
+          <thead>
+            <tr><th>Ngón</th><th>Trạng thái</th><th>Góc</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }).join("");
+
+    if ($("handPointsDetails").open) {
+      $("handPoints").textContent = JSON.stringify(data.hands, null, 2);
+    }
+  } else {
+    $("hands").textContent = "Chưa nhận diện bàn tay.";
+  }
+
+  if ($("bodyDetails").open) {
+    $("bodyPoints").textContent = JSON.stringify(data.body, null, 2);
+  }
+}
+
+// Polling /api/state
+let pollBusy = false;
+async function pollState() {
+  if (pollBusy) return;
+  pollBusy = true;
+  try {
+    const response = await fetch("/api/state", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    onData(await response.json());
+  } catch (error) {
+    document.getElementById("status").textContent = "Mất kết nối API: " + error.message;
+  } finally {
+    pollBusy = false;
+  }
+}
+setInterval(pollState, 500);
+pollState();
+</script>
+
+<script>
+const sosPreviousOnData = onData;
+
+onData = function(data) {
+  sosPreviousOnData(data);
+
+  const s = data.sos || {};
+  document.getElementById("sosPhase").textContent = s.phase || "WAITING";
+  document.getElementById("sosInstruction").textContent = s.instruction || "Đang chờ dữ liệu AI";
+  document.getElementById("sosHand").textContent = "Bàn tay: " + (s.hand || "?");
+  document.getElementById("sosRemaining").textContent = s.remaining_sec ? "Thời gian còn lại: " + s.remaining_sec + "s" : "";
+
+  const event = data.last_sos_event;
+  if (event) {
+    document.getElementById("sosAlert").style.display = "block";
+    document.getElementById("sosEvent").textContent = JSON.stringify(event, null, 2);
+  }
+};
+</script>
+
+<script>
+const previousOnDataForSeizure = onData;
+onData = function(data) {
+  previousOnDataForSeizure(data);
+  const s = data.seizure || {};
+  const phase = s.phase || 'NO_DATA';
+  const phases = {
+    NO_PERSON: 'Không thấy người',
+    LOW_VISIBILITY: 'Không thấy đủ vai hoặc cổ tay',
+    LOW_FPS: 'FPS quá thấp',
+    OBSERVING: 'Đang phân tích chuyển động',
+    RHYTHMIC_MOTION_CHECKING: 'Phát hiện chuyển động nhịp điệu, đang xác minh',
+    SUSPECTED_SEIZURE: 'NGHI CÓ CHUYỂN ĐỘNG CO GIẬT — CẦN KIỂM TRA',
+    COOLDOWN: 'Đang trong thời gian chờ chống lặp'
+  };
+  const el = document.getElementById('seizurePhase');
+  if (el) {
+    el.textContent = phases[phase] || phase;
+    el.style.color =
+      phase === 'SUSPECTED_SEIZURE' ? '#fb7185' :
+      phase === 'RHYTHMIC_MOTION_CHECKING' ? '#fde047' : '#4ade80';
+  }
+  const fpsEl = document.getElementById('seizureFPS');
+  if (fpsEl) fpsEl.textContent = String(data.fps ?? 0);
+
+  const mEl = document.getElementById('seizureMetrics');
+  if (mEl && mEl.parentElement.open) {
+    mEl.textContent = JSON.stringify(s.metrics || {}, null, 2);
+  }
+  const event = data.last_seizure_event;
+  const lastEventEl = document.getElementById('seizureLastEvent');
+  if (event && lastEventEl) {
+    lastEventEl.textContent = 'Sự kiện gần nhất: ' + event.event_type + ' (' + (event.detected_at || '') + ')';
+  }
+};
+</script>
+
+<script>
+(() => {
+  const DISPLAY_MS = 5000;
+  let latestSosState = null;
+  const previousOnDataForSosReset = onData;
+
+  function renderSosAlert() {
+    const card = document.getElementById("sosCard");
+    if (!card || !latestSosState) return;
+
+    const alert = document.getElementById("sosAlert");
+    const detail = document.getElementById("sosEvent");
+    const event = latestSosState.last_sos_event;
+    const occurred = event ? Date.parse(event.detected_at || "") : NaN;
+    const ageMs = Date.now() - occurred;
+    const visible = Boolean(event) && Number.isFinite(occurred) && ageMs >= -2000 && ageMs < DISPLAY_MS;
+
+    if (alert) alert.style.display = visible ? "block" : "none";
+    if (detail) {
+      detail.textContent = visible ? JSON.stringify(event, null, 2) : "Chưa có cảnh báo SOS mới.";
+    }
+  }
+
+  onData = function(data) {
+    previousOnDataForSosReset(data);
+    latestSosState = data;
+    renderSosAlert();
+  };
+
+  setInterval(renderSosAlert, 250);
+})();
+</script>
+
+</body>
+</html>
