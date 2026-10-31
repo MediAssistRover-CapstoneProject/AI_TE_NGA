@@ -1,0 +1,177 @@
+
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MediAssistRover Fall Detection</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 24px;
+      background: #0b1220;
+      color: #e5e7eb;
+    }
+    h1 { margin-top: 0; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+      gap: 18px;
+    }
+    .panel {
+      background: #172235;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 18px;
+      margin-bottom: 18px;
+    }
+    .camera-box {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #060a12;
+      border-radius: 8px;
+      height: 52vh;
+      max-height: 480px;
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+    img { max-height: 100%; max-width: 100%; object-fit: contain; border-radius: 6px; }
+    .status { color: #4ade80; font-weight: bold; }
+    .danger { color: #fb7185; }
+    .muted { color: #94a3b8; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    td, th { padding: 7px; border-bottom: 1px solid #334155; }
+    th { text-align: left; }
+    .scroll { max-height: 330px; overflow: auto; }
+    #alert { font-weight: bold; font-size: 18px; }
+    @media(max-width: 850px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+
+<body>
+  <h1>MediAssistRover — Fall Detection AI</h1>
+  <p class="muted">Local AI Monitoring · MediaPipe · FastAPI</p>
+
+  <div class="layout">
+    <div>
+      <div class="panel">
+        <h2>Camera realtime</h2>
+        <div class="camera-box">
+          <img src="/video" alt="Camera AI">
+        </div>
+        <p>Trạng thái: <span id="state" class="status">Đang khởi động</span></p>
+        <p>FPS: <span id="fps">0</span></p>
+        <p id="alert">Chưa ghi nhận cảnh báo</p>
+      </div>
+
+      <div class="panel">
+        <h2>Thông số tư thế</h2>
+        <p>Góc thân người: <span id="angle">—</span> độ</p>
+        <p>Tốc độ thay đổi Y của hông: <span id="speed">—</span></p>
+        <p class="muted">
+          Đây là số đo phục vụ thử nghiệm,
+          không phải kết luận y tế.
+        </p>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>Tọa độ các khớp cơ thể</h2>
+        <p class="muted">
+          X/Y/Z là tọa độ tương đối trong ảnh.
+          X_m/Y_m/Z_m là ước lượng 3D tương đối với tâm hông.
+        </p>
+
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>X</th>
+                <th>Y</th>
+                <th>Z</th>
+                <th>Z_m</th>
+              </tr>
+            </thead>
+            <tbody id="landmarks"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Sự kiện gần nhất</h2>
+        <pre id="event" style="white-space:pre-wrap;overflow-wrap:anywhere;">
+Chưa có sự kiện
+        </pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const stateEl = document.getElementById("state");
+    const fpsEl = document.getElementById("fps");
+    const alertEl = document.getElementById("alert");
+    const angleEl = document.getElementById("angle");
+    const speedEl = document.getElementById("speed");
+    const tableBody = document.getElementById("landmarks");
+    const eventEl = document.getElementById("event");
+
+    let lastEventId = null;
+
+    function connect() {
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+      ws.onmessage = (message) => {
+        const data = JSON.parse(message.data);
+
+        stateEl.textContent = data.state;
+        stateEl.className =
+          data.state === "SUSPECTED_FALL"
+            ? "status danger" : "status";
+
+        fpsEl.textContent = data.fps ?? 0;
+        angleEl.textContent = data.metrics?.torso_angle_deg ?? "—";
+        speedEl.textContent =
+          data.metrics?.hip_speed_normalized_per_sec ?? "—";
+
+        if (data.landmarks?.length) {
+          tableBody.innerHTML = data.landmarks.map(p => `
+            <tr>
+              <td>${p.id}</td>
+              <td>${p.x}</td>
+              <td>${p.y}</td>
+              <td>${p.z}</td>
+              <td>${p.z_m ?? "—"}</td>
+            </tr>
+          `).join("");
+        } else {
+          tableBody.innerHTML = "";
+        }
+
+        if (data.last_event &&
+            data.last_event.id !== lastEventId) {
+          lastEventId = data.last_event.id;
+          alertEl.textContent = "CẢNH BÁO: NGHI TÉ NGÃ";
+          alertEl.className = "danger";
+          eventEl.textContent = JSON.stringify(
+            data.last_event, null, 2
+          );
+        }
+      };
+
+      ws.onclose = () => {
+        stateEl.textContent = "Mất kết nối — đang thử lại";
+        setTimeout(connect, 2000);
+      };
+    }
+
+    connect();
+  </script>
+</body>
+</html>

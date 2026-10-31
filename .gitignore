@@ -1,0 +1,23 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables & secrets
+.env
+
+# Backup files
+*.bak
+*.tmp
+
+# Temporary test images & videos
+*.mp4
+camera_test_*.jpg
+
+# OS generated files
+Thumbs.db
+.DS_Store
