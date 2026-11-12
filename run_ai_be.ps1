@@ -9,12 +9,12 @@ Set-Location $ScriptDir
 $env:VIDEO_SOURCE = $CameraSource
 $env:POSE_BACKEND = "yolo"
 $env:YOLO_CONF = "0.14"
-$env:YOLO_IMGSZ = "800"
-$env:MAX_FRAME_DIM = "800"
-$env:TARGET_STREAM_FPS = "24"
-$env:AI_EVERY = "2"
-$env:MAX_POSES = "6"
-$env:HAND_EVERY = "6"
+$env:YOLO_IMGSZ = "640"
+$env:MAX_FRAME_DIM = "640"
+$env:TARGET_STREAM_FPS = "20"
+$env:AI_EVERY = "3"
+$env:MAX_POSES = "1"
+$env:HAND_EVERY = "4"
 $env:ENABLE_FACE = "false"
 $env:MQTT_ENABLED = "true"
 
