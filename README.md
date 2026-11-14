@@ -5,6 +5,32 @@
 
 ---
 
+## Phát hiện té ngã khi robot tuần tra
+
+`fall_service.py` chạy YOLOv8n-Pose bằng ONNX Runtime trên CPU. Khi workflow bật
+quan sát té ngã, Pi dùng nguồn ảnh ROS hiện có và gửi ảnh JPEG trong lúc robot
+đứng yên tại điểm quan sát. Service xử lý ảnh trong RAM và trả kết quả cho Pi.
+Pi báo sự kiện cho BE. Nút SOS hoạt động theo luồng SOS của BE.
+
+- `GET /health` kiểm tra service và model đã khởi động.
+- `POST /v1/fall/frame` nhận Bearer token, header `X-Fall-Session` là UUID của lượt
+  quan sát và body `image/jpeg` tối đa 256 KiB. Ảnh mỗi chiều tối đa 640 px.
+- Kết quả gồm `suspected_fall`, `confidence` và `algorithm`. Lượt quan sát đặt
+  lại theo UUID mới hoặc khi ảnh bị gián đoạn quá một giây. Kết quả nghi té ngã
+  cần được staff xác minh. Người đã nằm trước khi bắt đầu quan sát có thể bị bỏ sót.
+
+Trên EC2 ARM64, chuẩn bị Python 3.12 với `venv` và file
+`/etc/mediassistrover/fall-ai.env` thuộc root, mode `0600`. Đặt `FALL_API_TOKEN`
+từ nguồn bí mật triển khai. Service mặc định lắng nghe loopback ở cổng `7895`.
+Chạy `sudo bash deploy/install-fall.sh <release-sha>` để kiểm tra sẵn sàng và
+khôi phục release trước nếu khởi động thất bại. Nếu TLS kết thúc ở proxy trên
+EC2 khác, cấu hình `FALL_BIND_HOST` bằng IP riêng và chỉ cấp quyền từ proxy đó.
+
+GitHub Actions chạy kiểm tra trên ARM64 khi push `main` hoặc mở pull request.
+Việc áp dụng release lên EC2 hiện dùng bộ cài thủ công.
+
+---
+
 ## 1. Kiến Trúc & Luồng Hoạt Động (Architecture)
 
 ```text

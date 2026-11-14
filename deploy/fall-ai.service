@@ -1,0 +1,26 @@
+[Unit]
+Description=MediAssistRover stationary patrol fall inference
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=marfall
+Group=marfall
+WorkingDirectory=/opt/mar-fall/current
+Environment=FALL_BIND_HOST=127.0.0.1
+EnvironmentFile=/etc/mediassistrover/fall-ai.env
+ExecStart=/opt/mar-fall/current/.venv/bin/python -B -m uvicorn fall_service:app --host ${FALL_BIND_HOST} --port 7895 --workers 1 --no-access-log
+Restart=on-failure
+RestartSec=3
+CPUWeight=20
+CPUQuota=75%
+MemoryHigh=400M
+MemoryMax=512M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

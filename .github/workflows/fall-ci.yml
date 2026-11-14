@@ -1,0 +1,52 @@
+name: Fall inference CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-fall-service.txt
+      - name: Install production dependencies
+        run: python -m pip install --only-binary=:all: -r requirements-fall-service.txt 'httpx>=0.27,<1'
+      - name: Check fall logic and authenticated inference
+        run: |
+          bash -n deploy/install-fall.sh
+          python -B test_fall_detector.py
+          python -B - <<'PY'
+          import io
+          import os
+          from uuid import uuid4
+          from fastapi.testclient import TestClient
+          from PIL import Image
+          from fall_service import app
+
+          token = 'local-ci-only-token-0123456789abcdef'
+          os.environ['FALL_API_TOKEN'] = token
+          headers = {'Authorization': 'Bearer ' + token, 'Content-Type': 'image/jpeg',
+                     'X-Fall-Session': str(uuid4())}
+          image = io.BytesIO()
+          Image.new('RGB', (640, 480)).save(image, 'JPEG')
+          with TestClient(app) as client:
+              assert client.get('/health').json()['state'] == 'READY'
+              assert client.post('/v1/fall/frame', content=image.getvalue()).status_code == 401
+              assert client.post('/v1/fall/frame', content=b'bad JPEG', headers=headers).status_code == 422
+              response = client.post('/v1/fall/frame', content=image.getvalue(), headers=headers)
+              assert response.status_code == 200 and response.json()['suspected_fall'] is False
+              assert response.headers['cache-control'] == 'no-store'
+          PY
