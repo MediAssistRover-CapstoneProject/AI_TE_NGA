@@ -13,6 +13,58 @@ import math
 import os
 
 
+HIP_JOINTS = (23, 24)
+TORSO_JOINTS = (11, 12) + HIP_JOINTS
+BODY_JOINTS = TORSO_JOINTS + (25, 26, 27, 28)
+
+
+def visible_image_point(point):
+    """Return an observable keypoint inside the normalized image."""
+    if isinstance(point, dict):
+        x, y = point.get("x"), point.get("y")
+        visibility = point.get("visibility", 1.0)
+    else:
+        x, y = getattr(point, "x", None), getattr(point, "y", None)
+        visibility = getattr(point, "visibility", 1.0)
+    try:
+        x, y, visibility = float(x), float(y), float(visibility)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (not all(math.isfinite(value) for value in (x, y, visibility))
+            or not (0. <= x < 1. and 0. <= y < 1.) or visibility < .5):
+        return None
+    return x, y
+
+
+def observed_body_axis(points, width, height):
+    """Use the torso when visible, otherwise a visible extended lower leg."""
+    visible = {i: visible_image_point(points[i]) for i in BODY_JOINTS if i < len(points)}
+    if any(visible.get(i) is None for i in HIP_JOINTS):
+        return None
+    hips = tuple((visible[23][axis] + visible[24][axis]) / 2 for axis in (0, 1))
+    if all(visible.get(i) is not None for i in (11, 12)):
+        shoulders = tuple((visible[11][axis] + visible[12][axis]) / 2 for axis in (0, 1))
+        return visible, hips, shoulders, 'TORSO'
+    legs = []
+    for hip, knee, ankle in ((23, 25, 27), (24, 26, 28)):
+        if any(visible.get(i) is None for i in (hip, knee, ankle)):
+            continue
+        a, b, c = (visible[i] for i in (hip, knee, ankle))
+        upper = ((a[0] - b[0]) * width, (a[1] - b[1]) * height)
+        lower = ((c[0] - b[0]) * width, (c[1] - b[1]) * height)
+        lengths = math.hypot(*upper), math.hypot(*lower)
+        if min(lengths) < 10:
+            continue
+        cosine = sum(u * v for u, v in zip(upper, lower)) / (lengths[0] * lengths[1])
+        knee_angle = math.degrees(math.acos(max(-1., min(1., cosine))))
+        if knee_angle >= 145.:
+            legs.append((a, c))
+    if not legs:
+        return None
+    hip, ankle = max(legs, key=lambda p: math.hypot((p[0][0]-p[1][0])*width, (p[0][1]-p[1][1])*height))
+    return visible, hips, (hips[0] + ankle[0] - hip[0], hips[1] + ankle[1] - hip[1]), 'LOWER_BODY'
+
+
 class FallDetector:
     def __init__(self):
         self.angle_threshold = float(os.getenv("FALL_ANGLE_THRESHOLD", "50.0"))
@@ -20,6 +72,14 @@ class FallDetector:
         self.confirm_seconds = float(os.getenv("FALL_CONFIRM_SEC", "0.5"))
         self.cooldown_seconds = float(os.getenv("FALL_COOLDOWN_SEC", "20.0"))
         self.alert_duration = float(os.getenv("FALL_ALERT_DURATION", "7.0"))
+        self.floor_enabled = os.getenv("FLOOR_POSTURE_ENABLED", "true").lower() == "true"
+        self.floor_confirm_seconds = float(os.getenv("FLOOR_POSTURE_CONFIRM_SEC", "2.0"))
+        self.floor_angle_threshold = float(os.getenv("FLOOR_POSTURE_ANGLE_DEG", "70.0"))
+        self.floor_min_hip_y = float(os.getenv("FLOOR_POSTURE_MIN_HIP_Y", "0.45"))
+        if (not math.isfinite(self.floor_confirm_seconds) or not .5 <= self.floor_confirm_seconds <= 30.
+                or not math.isfinite(self.floor_angle_threshold) or not 60. <= self.floor_angle_threshold <= 90.
+                or not math.isfinite(self.floor_min_hip_y) or not 0. <= self.floor_min_hip_y < 1.):
+            raise ValueError("Invalid FLOOR_POSTURE configuration")
 
         self.prev = None
         self.motion_until = 0.0
@@ -28,83 +88,80 @@ class FallDetector:
         self.cooldown_until = 0.0
         self.alert_until = 0.0
         self.last_confidence = 0.0
+        self.floor_since = None
+        self.floor_model = None
+        self.floor_reported = False
+        self.last_detection_kind = None
 
     def reset_pose(self):
         self.prev = None
         self.candidate_since = None
         self.motion_until = 0.0
         self.peak_speed = 0.0
+        self.floor_since = None
+        self.floor_model = None
+        self.floor_reported = False
 
-    def update(self, points, width, height, now):
-        joints = [11, 12, 23, 24]
-
-        # Kiểm tra visibility (hỗ trợ cả MediaPipe Landmark object và dict)
-        for i in joints:
-            p = points[i] if i < len(points) else None
-            if p is None:
-                self.reset_pose()
-                return "LOW_VISIBILITY", {}, False
-            vis = getattr(p, "visibility", None)
-            if vis is None and isinstance(p, dict):
-                vis = p.get("visibility", 1.0)
-            if vis is not None and vis < 0.5:
-                self.reset_pose()
-                return "LOW_VISIBILITY", {}, False
-
-        def get_pt(p):
-            if isinstance(p, dict):
-                return float(p.get("x", 0.0)), float(p.get("y", 0.0))
-            return float(p.x), float(p.y)
-
-        s11_x, s11_y = get_pt(points[11])
-        s12_x, s12_y = get_pt(points[12])
-        h23_x, h23_y = get_pt(points[23])
-        h24_x, h24_y = get_pt(points[24])
-
-        shoulder_x = (s11_x + s12_x) / 2
-        shoulder_y = (s11_y + s12_y) / 2
-        hip_x = (h23_x + h24_x) / 2
-        hip_y = (h23_y + h24_y) / 2
+    def update(self, points, width, height, now, allow_transition=True):
+        body = observed_body_axis(points, width, height)
+        if body is None:
+            self.reset_pose()
+            hips = [visible_image_point(points[i]) if i < len(points) else None for i in HIP_JOINTS]
+            if all(point is not None for point in hips):
+                # Preserve the starting hip position when a close camera crops
+                # the shoulders/feet. This alone cannot confirm a horizontal body.
+                self.prev = (now, (hips[0][1] + hips[1][1]) / 2, None, 'HIP_ONLY')
+            return "LOW_VISIBILITY", {}, False
+        visible, (hip_x, hip_y), (axis_x, axis_y), body_model = body
 
         # Góc thân người (torso angle) so với phương thẳng đứng (0 = đứng thẳng, 90 = nằm ngang)
-        dx = (shoulder_x - hip_x) * width
-        dy = (shoulder_y - hip_y) * height
+        dx = (axis_x - hip_x) * width
+        dy = (axis_y - hip_y) * height
         angle = math.degrees(math.atan2(abs(dx), max(abs(dy), 0.001)))
 
         # Aspect ratio của bounding box cơ thể (rộng / cao)
         # Đứng: width < height (ratio < 0.65). Ngã ngang: ratio >= 0.95
-        key_indices = [11, 12, 23, 24, 25, 26, 27, 28]
-        valid_pts = [get_pt(points[i]) for i in key_indices if i < len(points)]
-        xs = [p[0] for p in valid_pts]
-        ys = [p[1] for p in valid_pts]
-        box_w = (max(xs) - min(xs)) * width if xs else 1
-        box_h = (max(ys) - min(ys)) * height if ys else 1
+        xs, ys = zip(*(point for point in visible.values() if point is not None))
+        box_w = (max(xs) - min(xs)) * width
+        box_h = (max(ys) - min(ys)) * height
         aspect_ratio = round(box_w / max(box_h, 1.0), 2)
 
         hip_speed = 0.0
         angular_speed = 0.0
 
         if self.prev is not None:
-            old_t, old_hip_y, old_angle = self.prev
+            old_t, old_hip_y, old_angle, old_model = self.prev
             dt = now - old_t
+            if dt <= 0. or dt > 1. or old_model != body_model:
+                self.floor_since, self.floor_model = None, None
 
-            if dt > 0.015:
+            if .015 < dt <= 1.:
                 # Vận tốc rơi theo trục Y (dương = rơi xuống sàn)
                 hip_speed = (hip_y - old_hip_y) / dt
-                angular_speed = abs(angle - old_angle) / dt
+                angular_speed = abs(angle - old_angle) / dt if old_model == body_model else 0.
+                if old_model != body_model:
+                    self.candidate_since = None
 
                 # Phát hiện rơi nhanh hoặc xoay lật đột ngột
                 rapid_drop = hip_speed > self.speed_threshold
                 rapid_rotation = angular_speed > 85.0 and hip_speed > 0.05
 
-                if rapid_drop or rapid_rotation:
+                if allow_transition and (rapid_drop or rapid_rotation):
                     self.motion_until = now + 1.8
                     self.peak_speed = max(self.peak_speed, hip_speed)
 
-        self.prev = (now, hip_y, angle)
+        if not allow_transition:
+            # Image displacement is not patient motion while the camera moves.
+            self.motion_until = 0.0
+            self.candidate_since = None
+            self.peak_speed = 0.0
+
+        self.prev = (now, hip_y, angle, body_model)
 
         # Tiêu chí tư thế ngang: góc >= ngưỡng HOẶC tỷ lệ khung bao ngang >= 0.95
         is_horizontal = (angle >= self.angle_threshold) or (aspect_ratio >= 0.95 and angle >= 40.0)
+        if body_model == 'LOWER_BODY':
+            is_horizontal = angle >= max(65., self.angle_threshold)
 
         # Tiêu chí độ cao thấp: hông ở nửa dưới khung hình (gần mặt sàn)
         # Loại trừ trường hợp cúi nhặt đồ nhưng hông vẫn ở vị trí đứng cao
@@ -122,6 +179,8 @@ class FallDetector:
             # Xác nhận tư thế nằm bất động sau va chạm trong khoảng confirm_seconds
             if immobility_duration >= self.confirm_seconds and now >= self.cooldown_until:
                 suspected = True
+                self.last_detection_kind = "FALL_TRANSITION"
+                self.floor_reported = True
                 self.cooldown_until = now + self.cooldown_seconds
                 self.alert_until = now + self.alert_duration
                 self.candidate_since = None
@@ -136,12 +195,33 @@ class FallDetector:
                 )
                 self.peak_speed = 0.0
         else:
+            # Confirmation requires a continuous low, horizontal posture after motion.
+            self.candidate_since = None
             if not is_horizontal:
-                self.candidate_since = None
                 self.peak_speed = 0.0
 
-        if now < self.alert_until:
+        # RGB supplies a suspicion only. The caller must verify this person's
+        # hip height using synchronized registered depth before reporting it.
+        floor_posture = (self.floor_enabled and angle >= self.floor_angle_threshold
+                         and hip_y > self.floor_min_hip_y)
+        if floor_posture:
+            if self.floor_since is None or self.floor_model != body_model:
+                self.floor_since, self.floor_model = now, body_model
+            floor_ready = now - self.floor_since >= self.floor_confirm_seconds
+            if floor_ready and not self.floor_reported and now >= self.cooldown_until:
+                suspected = True
+                self.floor_reported = True
+                self.last_detection_kind = "PERSON_ON_FLOOR"
+                self.last_confidence = round(min(.80, .55 + .20 * angle / 90.), 2)
+                self.cooldown_until = now + self.cooldown_seconds
+        else:
+            self.floor_since, self.floor_model, self.floor_reported = None, None, False
+            floor_ready = False
+
+        if self.last_detection_kind == "FALL_TRANSITION" and now < self.alert_until:
             state = "SUSPECTED_FALL"
+        elif floor_ready and self.last_detection_kind == "PERSON_ON_FLOOR":
+            state = "SUSPECTED_PERSON_ON_FLOOR"
         elif self.candidate_since is not None:
             state = "CHECKING"
         elif is_horizontal and is_low_elevation:
@@ -152,12 +232,16 @@ class FallDetector:
             state = "POSE_DETECTED"
 
         metrics = {
-            "torso_angle_deg": round(angle, 2),
+            "torso_angle_deg": round(angle, 2) if body_model == 'TORSO' else None,
+            "body_axis_angle_deg": round(angle, 2),
+            "body_model": body_model,
             "hip_y_normalized": round(hip_y, 4),
             "hip_speed_normalized_per_sec": round(hip_speed, 3),
             "angular_speed_deg_per_sec": round(angular_speed, 2),
             "aspect_ratio": aspect_ratio,
-            "confidence": self.last_confidence if state == "SUSPECTED_FALL" else None,
+            "confidence": self.last_confidence if state in ("SUSPECTED_FALL", "SUSPECTED_PERSON_ON_FLOOR") else None,
+            "detection_kind": self.last_detection_kind if state in ("SUSPECTED_FALL", "SUSPECTED_PERSON_ON_FLOOR") else None,
+            "ground_confirmation_required": state == "SUSPECTED_PERSON_ON_FLOOR",
             "phase": state,
         }
 
@@ -173,7 +257,11 @@ class MultiPersonFallTracker:
         self.tracks = {}
         self.next_person_id = 1
 
-    def update(self, all_poses, width, height, now):
+    def update(self, all_poses, width, height, now, allow_transition=True):
+        indexed_poses = [(index, pose) for index, pose in enumerate(all_poses) if all(
+            i < len(pose) and visible_image_point(pose[i]) is not None for i in HIP_JOINTS)]
+        original_indices = [index for index, _ in indexed_poses]
+        all_poses = [pose for _, pose in indexed_poses]
         if not all_poses:
             to_del = [tid for tid, t in self.tracks.items() if now - t["seen"] > self.timeout]
             for tid in to_del:
@@ -231,8 +319,14 @@ class MultiPersonFallTracker:
             detector = self.tracks[tid]["detector"]
             person_id = self.tracks[tid]["person_id"]
             pose = all_poses[pose_idx]
-
-            state, metrics, triggered = detector.update(pose, width, height, now)
+            center = centers[pose_idx]
+            ambiguous = any(index != pose_idx and math.hypot(center[0]-other[0], center[1]-other[1]) < .12
+                            for index, other in enumerate(centers))
+            if ambiguous:
+                detector.reset_pose()
+                state, metrics, triggered = 'AMBIGUOUS_PERSON', {}, False
+            else:
+                state, metrics, triggered = detector.update(pose, width, height, now, allow_transition)
 
             if triggered:
                 any_triggered = True
@@ -251,7 +345,7 @@ class MultiPersonFallTracker:
 
             results.append({
                 "person_id": person_id,
-                "pose_index": pose_idx,
+                "pose_index": original_indices[pose_idx],
                 "state": state,
                 "metrics": metrics,
                 "triggered": triggered,

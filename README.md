@@ -7,9 +7,9 @@
 
 ## Phát hiện té ngã khi robot tuần tra
 
-`fall_service.py` chạy YOLOv8n-Pose bằng ONNX Runtime trên CPU. Khi workflow bật
-quan sát té ngã, Pi dùng nguồn ảnh ROS hiện có và gửi ảnh JPEG trong lúc robot
-đứng yên tại điểm quan sát. Service xử lý ảnh trong RAM và trả kết quả cho Pi.
+`fall_service.py` chạy YOLOv8n-Pose bằng ONNX Runtime trên CPU. Pi dùng nguồn
+ảnh ROS hiện có và gửi ảnh JPEG theo chế độ quan sát được bật trong stack.
+Service xử lý ảnh trong RAM và trả kết quả cho Pi.
 Pi báo sự kiện cho BE. Nút SOS hoạt động theo luồng SOS của BE.
 
 - `GET /health` kiểm tra service và model đã khởi động.
@@ -17,7 +17,49 @@ Pi báo sự kiện cho BE. Nút SOS hoạt động theo luồng SOS của BE.
   quan sát và body `image/jpeg` tối đa 256 KiB. Ảnh mỗi chiều tối đa 640 px.
 - Kết quả gồm `suspected_fall`, `confidence` và `algorithm`. Lượt quan sát đặt
   lại theo UUID mới hoặc khi ảnh bị gián đoạn quá một giây. Kết quả nghi té ngã
-  cần được staff xác minh. Người đã nằm trước khi bắt đầu quan sát có thể bị bỏ sót.
+  cần được staff xác minh; RGB không tự khẳng định tình trạng y tế của người.
+- Khi một người kích hoạt cảnh báo trong khung hiện tại, `person` có thể chứa
+  `image_width`, `image_height` và `keypoints` gồm hông trái, hông phải theo
+  thứ tự. `x`, `y` được chuẩn hóa về `[0, 1)` trên ảnh JPEG Pi đã gửi. Pi dùng
+  đúng ảnh depth thẳng hàng với khung đó. Khi hông không rõ hoặc người khác ở
+  gần và có thể bị nhầm, kết quả vẫn báo nghi té ngã nhưng bỏ trường `person`.
+- Nhánh `PERSON_ON_FLOOR` quan sát người đã nằm trước khi robot đi tới: tư thế
+  ngang, hông thấp trên ảnh và cùng một track phải duy trì mặc định 2 giây.
+  Đây là nghi vấn từ RGB, chưa khẳng định người ở trên sàn. Phản hồi có
+  `detection_kind: "PERSON_ON_FLOOR"` và `ground_confirmation_required: true`.
+  Pi chỉ được báo loại này khi depth thẳng hàng và TF tại thời điểm chụp cho
+  thấy hông gần mặt sàn; thiếu depth/TF thì bỏ qua nghi vấn tĩnh đó. Staff
+  vẫn xác minh qua camera. Người nằm trên giường không được suy ra là ngã
+  chỉ từ hình ảnh ngang. Té ngã có chuyển động trước đó dùng loại riêng
+  `FALL_TRANSITION`.
+- Cấu hình nhánh tư thế tĩnh bằng `FLOOR_POSTURE_ENABLED=true`,
+  `FLOOR_POSTURE_CONFIRM_SEC=2`, `FLOOR_POSTURE_ANGLE_DEG=70` và
+  `FLOOR_POSTURE_MIN_HIP_Y=0.45`. Hai hông đơn lẻ, chân gập hoặc các track
+  nhập nhằng không hoàn tất cửa sổ xác nhận.
+- Client mới gửi `X-Fall-Captured-At` (ISO 8601 có múi giờ, không cũ hơn 2 giây)
+  và `X-Fall-Camera-Moving: true|false`. Thời gian chụp dùng để theo dõi tư thế;
+  thời gian nhận HTTP chỉ dùng để dọn phiên. Khung cũ/đảo thứ tự bị từ chối;
+  gửi lại đúng timestamp và nội dung trả kết quả cũ, không cộng thêm thời gian
+  quan sát. Khi camera đang di chuyển, nhánh vận tốc hông trên ảnh bị tắt vì
+  chưa bù chuyển động camera; nhánh tư thế tĩnh vẫn cần Pi xác minh depth.
+  Đổi trạng thái chuyển động khởi tạo lại track. Client checkpoint cũ không
+  gửi hai header vẫn hoạt động theo thời gian nhận như trước.
+
+Camera có thể chỉ thấy phần từ hông xuống. Khi vai ra ngoài ảnh, bộ phát hiện
+dùng hai hông và ít nhất một chuỗi hông–gối–cổ chân đủ rõ, chân gần duỗi để
+theo dõi trục thân dưới. Nhánh này cần dấu hiệu hông hạ nhanh, trục chân chuyển
+ngang và duy trì tư thế tối thiểu `FALL_CONFIRM_SEC`. Hai hông đơn lẻ không
+xác định được hướng cơ thể. Nếu chân bị gập/che hoặc các người đứng quá gần
+gây nhập nhằng, chuỗi quan sát được khởi tạo lại.
+Khi ban đầu chỉ có hai hông rõ trong ảnh, vị trí hông vẫn được theo dõi để
+nhận ra giai đoạn hạ xuống. Hướng ngang được kiểm tra khi phần thân/chân đủ rõ
+trong ảnh tiếp theo. Bản thuật toán có mã `yolov8n-pose-fall-v4`.
+
+YOLO cung cấp vị trí keypoint theo từng khung RGB. Theo dõi ở đây dùng vị trí
+hông theo thời gian, không phải nhận dạng danh tính bằng khuôn mặt. Người đã
+nằm sẵn có thể được báo theo nhánh tư thế tĩnh có kiểm tra depth; người ra
+ngoài khung hoặc bị che hoàn toàn vẫn có thể bị bỏ sót. Cần thử góc camera
+thực tế và các tình huống ngồi/cúi tại trường.
 
 Trên EC2 ARM64, chuẩn bị Python 3.12 với `venv` và file
 `/etc/mediassistrover/fall-ai.env` thuộc root, mode `0600`. Đặt `FALL_API_TOKEN`

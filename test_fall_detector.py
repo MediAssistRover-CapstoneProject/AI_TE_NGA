@@ -129,10 +129,71 @@ def test_negative_slow_lying():
     print("  [PASS] Negative control: Slowly lying down correctly rejected")
 
 
+def test_already_lying_requires_ground_confirmation():
+    """Already horizontal produces a separate suspicion after sustained view."""
+    events, _ = simulate_scenario(lambda t: (create_pose(.75, 80.), 640, 480), duration_sec=3.)
+    assert len(events) == 1
+    event = events[0]
+    assert event["time"] >= 2.
+    assert event["metrics"]["detection_kind"] == "PERSON_ON_FLOOR"
+    assert event["metrics"]["ground_confirmation_required"] is True
+    print("  [PASS] Already lying: sustained RGB suspicion requires depth floor check")
+
+
+def test_floor_posture_brief_or_occluded_does_not_accumulate():
+    """Brief/hidden poses cannot complete the sustained horizontal window."""
+    detector = FallDetector()
+    triggers = []
+    for index in range(12):
+        now = index * .25
+        visible = index not in (4, 8)
+        pose = create_pose(.75, 80., visibility=.99 if visible else .1)
+        _, _, triggered = detector.update(pose, 640, 480, now)
+        triggers.append(triggered)
+    assert not any(triggers)
+    print("  [PASS] Brief/occluded horizontal posture cannot complete confirmation")
+
+
+def test_lower_body_already_lying_and_folded_legs():
+    """A clear extended lower body works; hips alone or folded legs do not."""
+    def lower_pose(folded=False, hips_only=False):
+        points = [{"x": .5, "y": .5, "visibility": 0.} for _ in range(33)]
+        for hip, knee, ankle, y in ((23, 25, 27, .70), (24, 26, 28, .76)):
+            points[hip] = {"x": .3, "y": y, "visibility": .99}
+            if not hips_only:
+                points[knee] = {"x": .5, "y": y, "visibility": .99}
+                points[ankle] = {"x": .5 if folded else .75,
+                                 "y": y + .15 if folded else y, "visibility": .99}
+        return points
+    for kwargs, should_trigger in (({}, True), ({"folded": True}, False), ({"hips_only": True}, False)):
+        detector = FallDetector()
+        events = [detector.update(lower_pose(**kwargs), 640, 480, index * .25)[2] for index in range(13)]
+        assert any(events) is should_trigger, (kwargs, events)
+    print("  [PASS] Lower-body posture distinguishes clear legs from folded/missing legs")
+
+
+def test_moving_camera_suppresses_transition_not_ground_candidate():
+    detector = FallDetector()
+    detected = []
+    for index in range(20):
+        now = index * .25
+        hip, angle = ((.4, 5.) if index < 2 else (.75, 80.))
+        _, metrics, triggered = detector.update(create_pose(hip, angle), 640, 480, now, allow_transition=False)
+        if triggered:
+            detected.append(metrics)
+    assert detected and all(item["detection_kind"] == "PERSON_ON_FLOOR" for item in detected)
+    assert all(item["ground_confirmation_required"] for item in detected)
+    print("  [PASS] Moving camera cannot manufacture a FALL_TRANSITION event")
+
+
 if __name__ == "__main__":
     print("=== RUNNING FALL DETECTOR V2 VALIDATION SUITE ===")
     test_positive_fall()
     test_negative_bending()
     test_negative_sitting()
     test_negative_slow_lying()
-    print("=== ALL 4 FALL DETECTION TEST SCENARIOS PASSED ===")
+    test_already_lying_requires_ground_confirmation()
+    test_floor_posture_brief_or_occluded_does_not_accumulate()
+    test_lower_body_already_lying_and_folded_legs()
+    test_moving_camera_suppresses_transition_not_ground_candidate()
+    print("=== ALL 8 FALL DETECTION TEST SCENARIOS PASSED ===")

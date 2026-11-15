@@ -1,11 +1,13 @@
-"""Headless fall inference for stationary robot observation windows."""
+"""RGB pose suspicions; clients verify static floor postures with depth."""
 
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import hmac
 from io import BytesIO
+import math
 import os
 from pathlib import Path
 import threading
@@ -19,16 +21,17 @@ import onnxruntime as ort
 from PIL import Image, UnidentifiedImageError
 from starlette.concurrency import run_in_threadpool
 
-from fall_detector import MultiPersonFallTracker
+from fall_detector import BODY_JOINTS, HIP_JOINTS, MultiPersonFallTracker, visible_image_point
 
 
-ALGORITHM = "yolov8n-pose-fall-v2"
+ALGORITHM = "yolov8n-pose-fall-v4"
 MAX_FRAME_BYTES = 256 * 1024
 MAX_FRAME_EDGE = 640
 MODEL_EDGE = 416
 MAX_SESSIONS = 8
 SESSION_IDLE_SECONDS = 30
 MAX_FRAME_GAP_SECONDS = 1
+MIN_SEPARATION_NORMALIZED = .12
 # COCO pose indices mapped to the landmark indices FallDetector consumes.
 LANDMARKS = {5: 11, 6: 12, 11: 23, 12: 24, 13: 25, 14: 26, 15: 27, 16: 28}
 
@@ -92,14 +95,16 @@ class PoseModel:
         while remaining.size and len(poses) < 8:
             index, remaining = remaining[0], remaining[1:]
             keypoints = rows[index, 5:].reshape(17, 3)
-            if np.all(keypoints[[5, 6, 11, 12], 2] >= .5):
+            if np.all(keypoints[[11, 12], 2] >= .5):
                 pose = [{"x": 0., "y": 0., "visibility": 0.} for _ in range(33)]
                 for coco, expected in LANDMARKS.items():
                     point_x, point_y, confidence = keypoints[coco]
-                    pose[expected] = {"x": float(np.clip((point_x-x) / resized_width, 0, 1)),
-                                      "y": float(np.clip((point_y-y) / resized_height, 0, 1)),
+                    # Undo letterbox padding without clipping points into the image.
+                    pose[expected] = {"x": float((point_x - x) / resized_width),
+                                      "y": float((point_y - y) / resized_height),
                                       "visibility": float(confidence)}
-                poses.append(pose)
+                if all(visible_image_point(pose[joint]) is not None for joint in HIP_JOINTS):
+                    poses.append(pose)
             overlap = np.maximum(0, np.minimum(maximums[index], maximums[remaining])
                                  - np.maximum(minimums[index], minimums[remaining])).prod(axis=1)
             remaining = remaining[overlap / (areas[index] + areas[remaining] - overlap) < .45]
@@ -110,8 +115,43 @@ class PoseModel:
 class Observation:
     tracker: MultiPersonFallTracker
     received_at: float
+    frame_size: tuple[int, int]
     digest: bytes = b""
     confidence: float | None = None
+    person: dict | None = None
+    detection_kind: str | None = None
+    sample_at: float = 0.
+    capture_timed: bool = False
+    camera_moving: bool = False
+
+
+def pose_points(pose, joints):
+    return [visible_image_point(pose[i]) if i < len(pose) else None for i in joints]
+
+
+def person_geometry(poses, pose_index, width, height):
+    points = pose_points(poses[pose_index], HIP_JOINTS)
+    if any(point is None for point in points):
+        return None
+    hip_x = (points[0][0] + points[1][0]) / 2
+    hip_y = (points[0][1] + points[1][1]) / 2
+    for index, pose in enumerate(poses):
+        if index == pose_index:
+            continue
+        other_hips = pose_points(pose, HIP_JOINTS)
+        if any(point is None for point in other_hips):
+            continue
+        body = [point for point in pose_points(pose, BODY_JOINTS) if point is not None]
+        xs, ys = zip(*body)
+        if any(min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys) for x, y in points):
+            return None
+        # Nearby tracks can be confused during matching or depth sampling.
+        other_hip_x = (other_hips[0][0] + other_hips[1][0]) / 2
+        other_hip_y = (other_hips[0][1] + other_hips[1][1]) / 2
+        if math.hypot(other_hip_x - hip_x, other_hip_y - hip_y) < MIN_SEPARATION_NORMALIZED:
+            return None
+    return {"image_width": width, "image_height": height,
+            "keypoints": [{"x": x, "y": y} for x, y in points]}
 
 
 class FallService:
@@ -124,7 +164,7 @@ class FallService:
         self.sessions = {key: state for key, state in self.sessions.items()
                          if now - state.received_at <= SESSION_IDLE_SECONDS}
 
-    def observe(self, session, data, received_at):
+    def observe(self, session, data, received_at, captured_at=None, camera_moving=False):
         if not self.inference_lock.acquire(blocking=False):
             raise HTTPException(429, "FALL_BUSY")
         try:
@@ -133,26 +173,58 @@ class FallService:
             if state is None and len(self.sessions) >= MAX_SESSIONS:
                 raise HTTPException(429, "FALL_SESSION_LIMIT")
             digest = hashlib.sha256(data).digest()
-            if state is not None and received_at - state.received_at <= MAX_FRAME_GAP_SECONDS:
-                if digest == state.digest:
-                    return result(state.confidence)
-            else:
-                state = Observation(MultiPersonFallTracker(max_distance=.25), received_at)
+            sample_at = received_at if captured_at is None else captured_at
+            capture_timed = captured_at is not None
+            if (state is not None and received_at - state.received_at <= MAX_FRAME_GAP_SECONDS
+                    and digest == state.digest and state.capture_timed == capture_timed
+                    and state.camera_moving == camera_moving
+                    and (not capture_timed or sample_at == state.sample_at)):
+                return result(state.confidence, state.person, state.detection_kind)
+            if (state is not None and capture_timed and state.capture_timed
+                    and sample_at <= state.sample_at):
+                raise FrameError("FALL_FRAME_OUT_OF_ORDER")
 
             with decode_frame(data) as frame:
                 width, height = frame.size
                 poses = self.model.poses(frame)
-            _, _, triggered, info = state.tracker.update(poses, width, height, received_at)
+            if (state is None or received_at - state.received_at > MAX_FRAME_GAP_SECONDS
+                    or state.frame_size != (width, height) or state.capture_timed != capture_timed
+                    or state.camera_moving != camera_moving or sample_at - state.sample_at > MAX_FRAME_GAP_SECONDS):
+                state = Observation(MultiPersonFallTracker(max_distance=.25), received_at, (width, height),
+                                    sample_at=sample_at, capture_timed=capture_timed, camera_moving=camera_moving)
+            tracks, _, _, _ = state.tracker.update(poses, width, height, sample_at,
+                                                 allow_transition=not camera_moving)
+            triggers = [track for track in tracks if track["triggered"]]
             # A track missing from this frame cannot complete a prior transition.
             for track in state.tracker.tracks.values():
-                if track["seen"] != received_at:
+                if track["seen"] != sample_at:
                     track["detector"].reset_pose()
             state.received_at = received_at
             state.digest = digest
-            if triggered and info is not None:
-                state.confidence = info["metrics"]["confidence"]
+            state.sample_at = sample_at
+            state.person = None
+            # A static-posture suspicion is current-frame evidence, not a
+            # sticky event that can be attached to another person's later image.
+            if state.detection_kind == "PERSON_ON_FLOOR":
+                state.confidence, state.detection_kind = None, None
+            floor_tracks = [track for track in tracks if track["state"] == "SUSPECTED_PERSON_ON_FLOOR"]
+            if triggers:
+                scores = [track["metrics"]["confidence"] for track in triggers
+                          if track["metrics"]["confidence"] is not None]
+                if scores:
+                    state.confidence = max(scores)
+                    kinds = {track["metrics"].get("detection_kind", "FALL_TRANSITION") for track in triggers}
+                    state.detection_kind = "PERSON_ON_FLOOR" if kinds == {"PERSON_ON_FLOOR"} else "FALL_TRANSITION"
+                if len(triggers) == 1 and scores:
+                    # Geometry is valid only for that person's actual trigger frame.
+                    state.person = person_geometry(poses, triggers[0]["pose_index"], width, height)
+            elif floor_tracks and state.detection_kind != "FALL_TRANSITION":
+                state.confidence = max(track["metrics"]["confidence"] for track in floor_tracks)
+                state.detection_kind = "PERSON_ON_FLOOR"
+                if len(floor_tracks) == 1:
+                    state.person = person_geometry(poses, floor_tracks[0]["pose_index"], width, height)
             self.sessions[session] = state
-            return result(state.confidence)
+            return result(state.confidence, state.person, state.detection_kind)
         finally:
             self.inference_lock.release()
 
@@ -166,8 +238,39 @@ class FallService:
                     self.inference_lock.release()
 
 
-def result(confidence):
-    return {"suspected_fall": confidence is not None, "confidence": confidence, "algorithm": ALGORITHM}
+def result(confidence, person=None, detection_kind=None):
+    value = {"suspected_fall": confidence is not None, "confidence": confidence, "algorithm": ALGORITHM}
+    if confidence is not None:
+        value["detection_kind"] = detection_kind or "FALL_TRANSITION"
+        value["ground_confirmation_required"] = detection_kind == "PERSON_ON_FLOOR"
+    if person is not None:
+        value["person"] = person
+    return value
+
+
+def frame_context(headers, now=None):
+    """Acquisition time drives kinetics; receipt time is only for server expiry."""
+    raw = headers.get("X-Fall-Captured-At")
+    moving = headers.get("X-Fall-Camera-Moving")
+    if moving is not None and moving not in ("true", "false"):
+        raise FrameError("INVALID_FALL_CAMERA_MOTION")
+    if raw is None:
+        if moving is not None:
+            raise FrameError("FALL_MOTION_REQUIRES_CAPTURE_TIME")
+        return None, False
+    try:
+        if not 16 <= len(raw) <= 40:
+            raise ValueError()
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if stamp.utcoffset() is None:
+            raise ValueError()
+        captured_at = stamp.timestamp()
+    except (ValueError, OverflowError):
+        raise FrameError("INVALID_FALL_CAPTURE_TIME") from None
+    now = datetime.now(timezone.utc).timestamp() if now is None else now
+    if not math.isfinite(captured_at) or not -.5 <= now - captured_at <= 2.:
+        raise FrameError("FALL_CAPTURE_TIME_NOT_FRESH")
+    return captured_at, moving == "true"
 
 
 @asynccontextmanager
@@ -207,6 +310,10 @@ async def frame(request: Request):
         raise HTTPException(422, "INVALID_FALL_SESSION") from None
     if request.headers.get("Content-Type", "").lower().split(";", 1)[0].strip() != "image/jpeg":
         raise HTTPException(415, "FALL_REQUIRES_JPEG")
+    try:
+        captured_at, camera_moving = frame_context(request.headers)
+    except FrameError as error:
+        raise HTTPException(422, str(error)) from None
     if app.state.receiving.locked():
         raise HTTPException(429, "FALL_BUSY")
     async with app.state.receiving:
@@ -220,7 +327,8 @@ async def frame(request: Request):
         except TimeoutError:
             raise HTTPException(408, "FALL_FRAME_TIMEOUT") from None
         try:
-            value = await run_in_threadpool(app.state.service.observe, session, raw, time.monotonic())
+            value = await run_in_threadpool(app.state.service.observe, session, raw, time.monotonic(),
+                                           captured_at, camera_moving)
         except FrameError as error:
             raise HTTPException(422, str(error)) from None
     return JSONResponse(value, headers={"Cache-Control": "no-store"})
