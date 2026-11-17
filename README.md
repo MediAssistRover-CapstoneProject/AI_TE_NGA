@@ -18,6 +18,18 @@ Pi báo sự kiện cho BE. Nút SOS hoạt động theo luồng SOS của BE.
 - Kết quả gồm `suspected_fall`, `confidence` và `algorithm`. Lượt quan sát đặt
   lại theo UUID mới hoặc khi ảnh bị gián đoạn quá một giây. Kết quả nghi té ngã
   cần được staff xác minh; RGB không tự khẳng định tình trạng y tế của người.
+- Phản hồi có thêm `overlay` trên mỗi ảnh đã phân tích, kể cả ảnh không có người:
+  `width`, `height`, `captured_at`, `camera_moving`, `detections` (tối đa 8).
+  Mỗi detection có `bbox: [x,y,width,height]` chuẩn hóa `[0,1]`, `confidence`,
+  `track_id` hoặc `null`, và `state` là `PERSON`, `OBSERVING`, `SUSPECTED_FALL`
+  hoặc `PERSON_ON_FLOOR`. Bbox dùng lại chính kết quả YOLO pose; người chưa rõ
+  hông vẫn có khung nhưng không được suy ra đã đủ dữ liệu để xác định ngã.
+  Metadata không tự tạo cảnh báo và không thay đổi điều kiện xác minh depth.
+  Timestamp thuộc ảnh đầu vào; không dùng thời điểm trả HTTP thay thời điểm chụp.
+- WebRTC vẽ các khung này ở trình duyệt qua data channel `mar.ai.overlay.v1`.
+  Pi cần bản `patrol_fall.py`, `media_runtime.py`, `media_bridge.py` có overlay;
+  không chạy thêm model hoặc encode lại video trên Pi. Vẽ khung người không
+  yêu cầu map đã định vị; tọa độ bệnh nhân và xác minh người nằm trên sàn thì có.
 - Khi một người kích hoạt cảnh báo trong khung hiện tại, `person` có thể chứa
   `image_width`, `image_height` và `keypoints` gồm hông trái, hông phải theo
   thứ tự. `x`, `y` được chuẩn hóa về `[0, 1)` trên ảnh JPEG Pi đã gửi. Pi dùng
@@ -32,6 +44,10 @@ Pi báo sự kiện cho BE. Nút SOS hoạt động theo luồng SOS của BE.
   vẫn xác minh qua camera. Người nằm trên giường không được suy ra là ngã
   chỉ từ hình ảnh ngang. Té ngã có chuyển động trước đó dùng loại riêng
   `FALL_TRANSITION`.
+- `depth=True` cho biết module depth đã bật, chưa chứng minh ghép ảnh/TF thành
+  công. Phiên mới cần khởi tạo vị trí và đạt `LOCALIZED` để có TF map hợp lệ.
+  Pi phân biệt thiếu định vị, thiếu cặp depth, thiếu TF camera và người không
+  nằm gần sàn trong log; người đang đứng không được coi là té ngã.
 - Cấu hình nhánh tư thế tĩnh bằng `FLOOR_POSTURE_ENABLED=true`,
   `FLOOR_POSTURE_CONFIRM_SEC=2`, `FLOOR_POSTURE_ANGLE_DEG=70` và
   `FLOOR_POSTURE_MIN_HIP_Y=0.45`. Hai hông đơn lẻ, chân gập hoặc các track
@@ -211,6 +227,20 @@ PI_CAMERA_SOURCE=csi ./run_pi_camera.sh
 > Luồng video sẽ phát tại: `http://<IP_RASPBERRY_PI>:8090/video`.
 
 ---
+
+## CI và triển khai service dùng trong MAR
+
+`.github/workflows/fall-ci.yml` kiểm tra logic/model và API có xác thực trên ARM64.
+Khi push `main` hoặc chạy thủ công trên `main`, job deploy chờ verify thành công,
+đóng gói các file production và model, rồi dùng GitHub OIDC → S3 → SSM để cài
+lên EC2 media. Pull request chỉ chạy kiểm tra. Không lưu AWS access key hoặc
+fall token trong repo/artifact.
+
+Ba repository variables cần có: `FALL_DEPLOY_ROLE_ARN`, `FALL_ARTIFACT_BUCKET`,
+`FALL_MEDIA_INSTANCE_ID`. Role chỉ tin cậy repo này ở nhánh `main`, ghi/đọc
+prefix `ai-fall/releases/` và chạy đúng instance media. File bí mật hiện có
+`/etc/mediassistrover/fall-ai.env` tiếp tục nằm trên server. Installer kiểm tra
+health và khôi phục release cũ nếu bản mới không READY.
 
 ## 4. Cơ Chế Lưu Dữ Liệu Trong Database Của Backend (`BE_MAR`)
 

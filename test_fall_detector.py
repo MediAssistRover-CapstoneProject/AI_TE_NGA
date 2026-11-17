@@ -186,6 +186,112 @@ def test_moving_camera_suppresses_transition_not_ground_candidate():
     print("  [PASS] Moving camera cannot manufacture a FALL_TRANSITION event")
 
 
+def test_overlay_uses_one_pose_inference_and_keeps_partial_people_boxes():
+    from types import SimpleNamespace
+    import numpy as np
+    from PIL import Image
+    from fall_service import PoseModel, overlay_result
+
+    # Raw YOLO boxes are in the 416-square letterbox. The first person is
+    # clipped by the image border and has no trustworthy hips.
+    partial = np.zeros(56, dtype=np.float32)
+    partial[:5] = [40., 160., 160., 240., .9]
+    whole = np.zeros(56, dtype=np.float32)
+    whole[:5] = [312., 208., 100., 200., .8]
+    points = whole[5:].reshape(17, 3)
+    points[:] = [312., 208., .95]
+    points[11] = [300., 230., .95]
+    points[12] = [330., 230., .95]
+    rows = np.stack([partial, whole], axis=1)[None]
+    calls = []
+    def infer(names, tensors):
+        calls.append(tensors)
+        return [rows]
+    model = PoseModel.__new__(PoseModel)
+    model.input_name = 'images';model.session = SimpleNamespace(run=infer)
+    with Image.new('RGB', (640, 480), (127, 127, 127)) as frame:
+        poses = model.poses(frame)
+    assert len(calls) == 1 and len(poses) == 1 and len(poses.detections) == 2
+    assert poses.detections[0]['pose_index'] is None
+    overlay = overlay_result(poses, [{'pose_index': 0, 'person_id': 7, 'state': 'CHECKING'}],
+                             640, 480, 1000., False)
+    partial_box, tracked = overlay['detections']
+    assert partial_box['track_id'] is None and partial_box['state'] == 'PERSON'
+    assert partial_box['bbox'][0] == 0. and partial_box['bbox'][1] == 0.
+    assert tracked['track_id'] == 7 and tracked['state'] == 'OBSERVING'
+    for detection in overlay['detections']:
+        x, y, width, height = detection['bbox']
+        assert 0. <= x < x + width <= 1. and 0. <= y < y + height <= 1.
+        assert 0. <= detection['confidence'] <= 1.
+    # A crowded image remains bounded without a second person model.
+    rows = np.stack([np.array([20.+index*38., 208., 12., 20., .9] + [0.]*51,
+                              dtype=np.float32) for index in range(10)], axis=1)[None]
+    with Image.new('RGB', (640, 480)) as frame:
+        assert len(model.poses(frame).detections) == 8
+    assert len(calls) == 2
+    print('  [PASS] Overlay retains partial people, clips boxes and uses one pose inference per frame')
+
+
+def test_overlay_cache_keeps_capture_time_and_new_empty_frame_clears_boxes():
+    from io import BytesIO
+    from PIL import Image
+    from fall_service import FallService, PoseBatch
+
+    first = PoseBatch();first.extend([create_pose(.45, 5.)])
+    first.detections = [{'pose_index': 0, 'bbox': [.2, .1, .4, .8], 'confidence': .9}]
+    shifted = PoseBatch();shifted.extend([create_pose(.45, 5.)])
+    shifted.detections = [{'pose_index': 0, 'bbox': [.25, .1, .4, .8], 'confidence': .9}]
+    class Model:
+        def __init__(self):self.calls = 0
+        def poses(self, frame):
+            self.calls += 1
+            return [first, shifted, PoseBatch()][self.calls-1]
+    model = Model();service = FallService(model);stream = BytesIO()
+    with Image.new('RGB', (640, 480)) as frame:frame.save(stream, format='JPEG')
+    jpeg = stream.getvalue()
+    initial = service.observe('overlay', jpeg, 10., 1000.)
+    cached = service.observe('overlay', jpeg, 10.1, 1000.)
+    assert model.calls == 1 and cached['overlay'] == initial['overlay']
+    assert cached['overlay']['captured_at'] == '1970-01-01T00:16:40+00:00'
+    fresh = service.observe('overlay', jpeg, 10.2, 1000.2)
+    assert model.calls == 2 and fresh['overlay']['captured_at'] != initial['overlay']['captured_at']
+    assert fresh['overlay']['detections'][0]['bbox'] != initial['overlay']['detections'][0]['bbox']
+    assert fresh['overlay']['detections'][0]['track_id'] == initial['overlay']['detections'][0]['track_id']
+    empty = service.observe('overlay', jpeg, 10.4, 1000.4)
+    assert model.calls == 3 and empty['overlay']['detections'] == []
+    assert service.observe('overlay', jpeg, 10.5, 1000.4)['overlay']['detections'] == []
+    assert model.calls == 3 and empty['suspected_fall'] is False
+    print('  [PASS] Overlay cache preserves capture time; a fresh empty frame clears old boxes')
+
+
+def test_overlay_floor_state_matches_existing_fall_suspicion_and_clears():
+    from io import BytesIO
+    from PIL import Image
+    from fall_service import FallService, PoseBatch
+
+    class Model:
+        present = True
+        def poses(self, frame):
+            batch = PoseBatch()
+            if self.present:
+                batch.append(create_pose(.75, 80.))
+                batch.detections = [{'pose_index': 0, 'bbox': [.1, .1, .8, .8], 'confidence': .9}]
+            return batch
+    stream = BytesIO()
+    with Image.new('RGB', (640, 480)) as frame:frame.save(stream, format='JPEG')
+    jpeg = stream.getvalue();model = Model();service = FallService(model)
+    for index in range(13):
+        value = service.observe('floor', jpeg, 10.+index*.25, 1000.+index*.25)
+    assert value['suspected_fall'] is True and value['detection_kind'] == 'PERSON_ON_FLOOR'
+    assert value['ground_confirmation_required'] is True
+    assert value['overlay']['detections'][0]['state'] == 'PERSON_ON_FLOOR'
+    assert len(value['person']['keypoints']) == 2
+    model.present = False
+    empty = service.observe('floor', jpeg, 13.25, 1003.25)
+    assert empty['overlay']['detections'] == [] and empty['suspected_fall'] is False
+    print('  [PASS] Overlay floor state matches the existing depth-confirmation-required suspicion contract')
+
+
 if __name__ == "__main__":
     print("=== RUNNING FALL DETECTOR V2 VALIDATION SUITE ===")
     test_positive_fall()
@@ -196,4 +302,7 @@ if __name__ == "__main__":
     test_floor_posture_brief_or_occluded_does_not_accumulate()
     test_lower_body_already_lying_and_folded_legs()
     test_moving_camera_suppresses_transition_not_ground_candidate()
-    print("=== ALL 8 FALL DETECTION TEST SCENARIOS PASSED ===")
+    test_overlay_uses_one_pose_inference_and_keeps_partial_people_boxes()
+    test_overlay_cache_keeps_capture_time_and_new_empty_frame_clears_boxes()
+    test_overlay_floor_state_matches_existing_fall_suspicion_and_clears()
+    print("=== ALL 11 FALL DETECTION / OVERLAY TEST SCENARIOS PASSED ===")

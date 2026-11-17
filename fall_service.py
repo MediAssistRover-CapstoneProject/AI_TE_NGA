@@ -20,6 +20,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image, UnidentifiedImageError
 from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
 
 from fall_detector import BODY_JOINTS, HIP_JOINTS, MultiPersonFallTracker, visible_image_point
 
@@ -38,6 +39,13 @@ LANDMARKS = {5: 11, 6: 12, 11: 23, 12: 24, 13: 25, 14: 26, 15: 27, 16: 28}
 
 class FrameError(ValueError):
     pass
+
+
+class PoseBatch(list):
+    """Keep detector boxes beside the unchanged poses used by fall/depth logic."""
+    def __init__(self):
+        super().__init__()
+        self.detections = []
 
 
 def decode_frame(data):
@@ -85,15 +93,16 @@ class PoseModel:
         rows = rows[(rows[:, 4] >= .4) & np.isfinite(rows).all(axis=1)
                     & (rows[:, 2] > 0) & (rows[:, 3] > 0)]
         if not len(rows):
-            return []
+            return PoseBatch()
         rows = rows[np.argsort(-rows[:, 4], kind="stable")[:128]]
-        poses = []
+        poses = PoseBatch()
         centers, half = rows[:, :2], rows[:, 2:4] / 2
         minimums, maximums = centers - half, centers + half
         areas = rows[:, 2] * rows[:, 3]
         remaining = np.arange(len(rows))
-        while remaining.size and len(poses) < 8:
+        while remaining.size and len(poses.detections) < 8:
             index, remaining = remaining[0], remaining[1:]
+            pose_index = None
             keypoints = rows[index, 5:].reshape(17, 3)
             if np.all(keypoints[[11, 12], 2] >= .5):
                 pose = [{"x": 0., "y": 0., "visibility": 0.} for _ in range(33)]
@@ -104,7 +113,14 @@ class PoseModel:
                                       "y": float((point_y - y) / resized_height),
                                       "visibility": float(confidence)}
                 if all(visible_image_point(pose[joint]) is not None for joint in HIP_JOINTS):
+                    pose_index = len(poses)
                     poses.append(pose)
+            left, top = np.maximum(0., (minimums[index] - (x, y)) / (resized_width, resized_height))
+            right, bottom = np.minimum(1., (maximums[index] - (x, y)) / (resized_width, resized_height))
+            if right > left and bottom > top:
+                poses.detections.append({"pose_index": pose_index,
+                    "bbox": [float(left), float(top), float(right-left), float(bottom-top)],
+                    "confidence": float(np.clip(rows[index, 4], 0., 1.))})
             overlap = np.maximum(0, np.minimum(maximums[index], maximums[remaining])
                                  - np.maximum(minimums[index], minimums[remaining])).prod(axis=1)
             remaining = remaining[overlap / (areas[index] + areas[remaining] - overlap) < .45]
@@ -123,6 +139,25 @@ class Observation:
     sample_at: float = 0.
     capture_timed: bool = False
     camera_moving: bool = False
+    overlay: dict | None = None
+
+
+def overlay_result(poses, tracks, width, height, captured_at, moving):
+    by_pose = {track["pose_index"]: track for track in tracks}
+    detections = []
+    for detection in getattr(poses, "detections", [])[:8]:
+        track = by_pose.get(detection["pose_index"])
+        state = "PERSON"
+        if track:
+            state = {"SUSPECTED_FALL": "SUSPECTED_FALL",
+                     "SUSPECTED_PERSON_ON_FLOOR": "PERSON_ON_FLOOR",
+                     "CHECKING": "OBSERVING", "HORIZONTAL_POSTURE": "OBSERVING"}.get(track["state"], "PERSON")
+        detections.append({"track_id": track["person_id"] if track else None,
+                           "bbox": detection["bbox"], "confidence": detection["confidence"], "state": state})
+    stamp = (datetime.fromtimestamp(captured_at, timezone.utc).isoformat()
+             if captured_at is not None else None)
+    return {"width": width, "height": height, "captured_at": stamp,
+            "camera_moving": moving, "detections": detections}
 
 
 def pose_points(pose, joints):
@@ -179,7 +214,7 @@ class FallService:
                     and digest == state.digest and state.capture_timed == capture_timed
                     and state.camera_moving == camera_moving
                     and (not capture_timed or sample_at == state.sample_at)):
-                return result(state.confidence, state.person, state.detection_kind)
+                return result(state.confidence, state.person, state.detection_kind, state.overlay)
             if (state is not None and capture_timed and state.capture_timed
                     and sample_at <= state.sample_at):
                 raise FrameError("FALL_FRAME_OUT_OF_ORDER")
@@ -194,6 +229,7 @@ class FallService:
                                     sample_at=sample_at, capture_timed=capture_timed, camera_moving=camera_moving)
             tracks, _, _, _ = state.tracker.update(poses, width, height, sample_at,
                                                  allow_transition=not camera_moving)
+            state.overlay = overlay_result(poses, tracks, width, height, captured_at, camera_moving)
             triggers = [track for track in tracks if track["triggered"]]
             # A track missing from this frame cannot complete a prior transition.
             for track in state.tracker.tracks.values():
@@ -224,7 +260,7 @@ class FallService:
                 if len(floor_tracks) == 1:
                     state.person = person_geometry(poses, floor_tracks[0]["pose_index"], width, height)
             self.sessions[session] = state
-            return result(state.confidence, state.person, state.detection_kind)
+            return result(state.confidence, state.person, state.detection_kind, state.overlay)
         finally:
             self.inference_lock.release()
 
@@ -238,13 +274,15 @@ class FallService:
                     self.inference_lock.release()
 
 
-def result(confidence, person=None, detection_kind=None):
+def result(confidence, person=None, detection_kind=None, overlay=None):
     value = {"suspected_fall": confidence is not None, "confidence": confidence, "algorithm": ALGORITHM}
     if confidence is not None:
         value["detection_kind"] = detection_kind or "FALL_TRANSITION"
         value["ground_confirmation_required"] = detection_kind == "PERSON_ON_FLOOR"
     if person is not None:
         value["person"] = person
+    if overlay is not None:
+        value["overlay"] = overlay
     return value
 
 
@@ -326,6 +364,10 @@ async def frame(request: Request):
                     raw.extend(chunk)
         except TimeoutError:
             raise HTTPException(408, "FALL_FRAME_TIMEOUT") from None
+        except ClientDisconnect:
+            # A timed-out/mobile client can leave during upload. This is a
+            # request interruption, not an inference crash or a traceback.
+            raise HTTPException(499, "FALL_CLIENT_DISCONNECTED") from None
         try:
             value = await run_in_threadpool(app.state.service.observe, session, raw, time.monotonic(),
                                            captured_at, camera_moving)
