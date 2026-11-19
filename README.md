@@ -69,7 +69,14 @@ xác định được hướng cơ thể. Nếu chân bị gập/che hoặc các
 gây nhập nhằng, chuỗi quan sát được khởi tạo lại.
 Khi ban đầu chỉ có hai hông rõ trong ảnh, vị trí hông vẫn được theo dõi để
 nhận ra giai đoạn hạ xuống. Hướng ngang được kiểm tra khi phần thân/chân đủ rõ
-trong ảnh tiếp theo. Bản thuật toán có mã `yolov8n-pose-fall-v4`.
+trong ảnh tiếp theo. Bản thuật toán có mã `yolov8n-pose-fall-v5`.
+
+Người hướng chân về camera có thể tạo `floor_candidate` sau một lượt quan
+sát liên tục. Đây chỉ là đề nghị đo depth, không phải `suspected_fall` từ RGB.
+Pi phải xác minh cùng người có hông và chân/gối thấp, đoạn cơ thể gần ngang
+trong không gian 3D và đúng TF trước khi gửi `PERSON_ON_FLOOR` cho staff xem
+camera. Có thể tắt nhánh này bằng `FLOOR_END_ON_ENABLED=false`. Điểm confidence
+là điểm quy tắc, chưa phải xác suất té ngã hoặc độ chính xác đã kiểm định.
 
 YOLO cung cấp vị trí keypoint theo từng khung RGB. Theo dõi ở đây dùng vị trí
 hông theo thời gian, không phải nhận dạng danh tính bằng khuôn mặt. Người đã

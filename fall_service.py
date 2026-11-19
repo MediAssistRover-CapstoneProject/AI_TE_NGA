@@ -2,11 +2,12 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import hmac
 from io import BytesIO
+import logging
 import math
 import os
 from pathlib import Path
@@ -22,10 +23,11 @@ from PIL import Image, UnidentifiedImageError
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
-from fall_detector import BODY_JOINTS, HIP_JOINTS, MultiPersonFallTracker, visible_image_point
+from fall_detector import (BODY_JOINTS, MultiPersonFallTracker, center_point,
+                           visible_hips, visible_image_point)
 
 
-ALGORITHM = "yolov8n-pose-fall-v4"
+ALGORITHM = "yolov8n-pose-fall-v5"
 MAX_FRAME_BYTES = 256 * 1024
 MAX_FRAME_EDGE = 640
 MODEL_EDGE = 416
@@ -33,6 +35,7 @@ MAX_SESSIONS = 8
 SESSION_IDLE_SECONDS = 30
 MAX_FRAME_GAP_SECONDS = 1
 MIN_SEPARATION_NORMALIZED = .12
+LOGGER = logging.getLogger("fall_ai")
 # COCO pose indices mapped to the landmark indices FallDetector consumes.
 LANDMARKS = {5: 11, 6: 12, 11: 23, 12: 24, 13: 25, 14: 26, 15: 27, 16: 28}
 
@@ -104,7 +107,7 @@ class PoseModel:
             index, remaining = remaining[0], remaining[1:]
             pose_index = None
             keypoints = rows[index, 5:].reshape(17, 3)
-            if np.all(keypoints[[11, 12], 2] >= .5):
+            if np.any(keypoints[[11, 12], 2] >= .5):
                 pose = [{"x": 0., "y": 0., "visibility": 0.} for _ in range(33)]
                 for coco, expected in LANDMARKS.items():
                     point_x, point_y, confidence = keypoints[coco]
@@ -112,7 +115,7 @@ class PoseModel:
                     pose[expected] = {"x": float((point_x - x) / resized_width),
                                       "y": float((point_y - y) / resized_height),
                                       "visibility": float(confidence)}
-                if all(visible_image_point(pose[joint]) is not None for joint in HIP_JOINTS):
+                if visible_hips(pose):
                     pose_index = len(poses)
                     poses.append(pose)
             left, top = np.maximum(0., (minimums[index] - (x, y)) / (resized_width, resized_height))
@@ -136,10 +139,13 @@ class Observation:
     confidence: float | None = None
     person: dict | None = None
     detection_kind: str | None = None
+    visual_review_eligible: bool = False
     sample_at: float = 0.
     capture_timed: bool = False
     camera_moving: bool = False
     overlay: dict | None = None
+    floor_candidates: dict = field(default_factory=dict)
+    floor_candidate: dict | None = None
 
 
 def overlay_result(poses, tracks, width, height, captured_at, moving):
@@ -164,29 +170,86 @@ def pose_points(pose, joints):
     return [visible_image_point(pose[i]) if i < len(pose) else None for i in joints]
 
 
-def person_geometry(poses, pose_index, width, height):
-    points = pose_points(poses[pose_index], HIP_JOINTS)
+def person_geometry(poses, pose_index, width, height, depth_joints):
+    points = pose_points(poses[pose_index], depth_joints)
     if any(point is None for point in points):
         return None
-    hip_x = (points[0][0] + points[1][0]) / 2
-    hip_y = (points[0][1] + points[1][1]) / 2
+    hip_center = center_point(visible_hips(poses[pose_index]).values())
     for index, pose in enumerate(poses):
         if index == pose_index:
             continue
-        other_hips = pose_points(pose, HIP_JOINTS)
-        if any(point is None for point in other_hips):
-            continue
+        other_hips = visible_hips(pose)
         body = [point for point in pose_points(pose, BODY_JOINTS) if point is not None]
         xs, ys = zip(*body)
         if any(min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys) for x, y in points):
             return None
         # Nearby tracks can be confused during matching or depth sampling.
-        other_hip_x = (other_hips[0][0] + other_hips[1][0]) / 2
-        other_hip_y = (other_hips[0][1] + other_hips[1][1]) / 2
-        if math.hypot(other_hip_x - hip_x, other_hip_y - hip_y) < MIN_SEPARATION_NORMALIZED:
+        if math.dist(hip_center, center_point(other_hips.values())) < MIN_SEPARATION_NORMALIZED:
             return None
-    return {"image_width": width, "image_height": height,
+    for box in getattr(poses, "detections", []):
+        if box["pose_index"] is not None:
+            continue
+        x, y, box_width, box_height = box["bbox"]
+        if any(x <= px <= x + box_width and y <= py <= y + box_height for px, py in points):
+            return None
+    visible = [point for point in pose_points(poses[pose_index], BODY_JOINTS) if point is not None]
+    xs, ys = zip(*visible)
+    box = [min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys)]
+    for detection in getattr(poses, "detections", []):
+        if detection["pose_index"] == pose_index:
+            box = detection["bbox"]
+            break
+    roles = {23: 'hip', 24: 'hip', 25: 'knee', 26: 'knee', 27: 'ankle', 28: 'ankle',
+             11: 'shoulder', 12: 'shoulder'}
+    return {"image_width": width, "image_height": height, "bbox": box,
+            "keypoint_roles": [roles.get(joint, 'body') for joint in depth_joints],
             "keypoints": [{"x": x, "y": y} for x, y in points]}
+
+
+def depth_floor_candidate(state, poses, tracks, width, height, now, moving):
+    """An end-on image is ambiguous; only depth can establish a low 3-D body.
+
+    This does not set suspected_fall or bypass staff camera review. Keep a
+    continuous, bounded view of the same track before asking Pi to measure it.
+    """
+    current = {}
+    ready = []
+    for track in tracks if not moving and os.getenv('FLOOR_END_ON_ENABLED', 'true').lower() == 'true' else ():
+        if track['state'] == 'AMBIGUOUS_PERSON':
+            continue
+        index = track['pose_index']
+        pose = poses[index]
+        choices = []
+        for hip, knee, ankle in ((23, 25, 27), (24, 26, 28)):
+            first = visible_image_point(pose[hip]) if hip < len(pose) else None
+            if first is None or first[1] <= .45:
+                continue
+            for support in (ankle, knee):
+                second = visible_image_point(pose[support]) if support < len(pose) else None
+                if second is not None:
+                    length = math.hypot((first[0]-second[0])*width, (first[1]-second[1])*height)
+                    if length >= 12.:
+                        choices.append((support in (27, 28), length, (hip, support)))
+        if not choices:
+            continue
+        joints = max(choices)[2]
+        person = person_geometry(poses, index, width, height, joints)
+        if person is None:
+            continue
+        tid = track['person_id']
+        prior = state.floor_candidates.get(tid)
+        center = track['center']
+        continuous = (prior is not None and 0. < now-prior['last'] <= 1.
+                      and math.dist(center, prior['center']) <= .08)
+        since = prior['since'] if continuous else now
+        current[tid] = {'since': since, 'last': now, 'center': center}
+        detector = state.tracker.tracks[tid]['detector']
+        if detector.floor_enabled and now-since >= detector.floor_confirm_seconds:
+            ready.append({'reason': 'END_ON_LOWER_BODY', 'confidence': .55, 'track_id': tid,
+                          'ground_confirmation_required': True, 'visual_review_eligible': False,
+                          'person': person})
+    state.floor_candidates = current
+    return ready[0] if len(ready) == 1 else None
 
 
 class FallService:
@@ -214,7 +277,8 @@ class FallService:
                     and digest == state.digest and state.capture_timed == capture_timed
                     and state.camera_moving == camera_moving
                     and (not capture_timed or sample_at == state.sample_at)):
-                return result(state.confidence, state.person, state.detection_kind, state.overlay)
+                return result(state.confidence, state.person, state.detection_kind, state.overlay,
+                              state.visual_review_eligible, state.floor_candidate)
             if (state is not None and capture_timed and state.capture_timed
                     and sample_at <= state.sample_at):
                 raise FrameError("FALL_FRAME_OUT_OF_ORDER")
@@ -225,11 +289,13 @@ class FallService:
             if (state is None or received_at - state.received_at > MAX_FRAME_GAP_SECONDS
                     or state.frame_size != (width, height) or state.capture_timed != capture_timed
                     or state.camera_moving != camera_moving or sample_at - state.sample_at > MAX_FRAME_GAP_SECONDS):
-                state = Observation(MultiPersonFallTracker(max_distance=.25), received_at, (width, height),
+                state = Observation(MultiPersonFallTracker(max_distance=.25, allow_partial=True),
+                                    received_at, (width, height),
                                     sample_at=sample_at, capture_timed=capture_timed, camera_moving=camera_moving)
             tracks, _, _, _ = state.tracker.update(poses, width, height, sample_at,
                                                  allow_transition=not camera_moving)
             state.overlay = overlay_result(poses, tracks, width, height, captured_at, camera_moving)
+            state.floor_candidate = depth_floor_candidate(state, poses, tracks, width, height, sample_at, camera_moving)
             triggers = [track for track in tracks if track["triggered"]]
             # A track missing from this frame cannot complete a prior transition.
             for track in state.tracker.tracks.values():
@@ -239,9 +305,12 @@ class FallService:
             state.digest = digest
             state.sample_at = sample_at
             state.person = None
+            state.visual_review_eligible = False
             # A static-posture suspicion is current-frame evidence, not a
             # sticky event that can be attached to another person's later image.
-            if state.detection_kind == "PERSON_ON_FLOOR":
+            transition_visible = any(track["state"] == "SUSPECTED_FALL" for track in tracks)
+            if state.detection_kind == "PERSON_ON_FLOOR" or (
+                    state.detection_kind == "FALL_TRANSITION" and not transition_visible):
                 state.confidence, state.detection_kind = None, None
             floor_tracks = [track for track in tracks if track["state"] == "SUSPECTED_PERSON_ON_FLOOR"]
             if triggers:
@@ -253,14 +322,26 @@ class FallService:
                     state.detection_kind = "PERSON_ON_FLOOR" if kinds == {"PERSON_ON_FLOOR"} else "FALL_TRANSITION"
                 if len(triggers) == 1 and scores:
                     # Geometry is valid only for that person's actual trigger frame.
-                    state.person = person_geometry(poses, triggers[0]["pose_index"], width, height)
+                    trigger = triggers[0]
+                    metrics = trigger["metrics"]
+                    state.person = person_geometry(poses, trigger["pose_index"], width, height,
+                                                   metrics["depth_joints"])
+                    state.visual_review_eligible = metrics["visual_review_eligible"] and state.person is not None
+                    LOGGER.warning("FALL_RGB_SUSPICION kind=%s track_id=%d body_model=%s depth_points=%s "
+                                   "visual_review_eligible=%s", state.detection_kind, trigger["person_id"],
+                                   metrics["body_model"], state.person is not None, state.visual_review_eligible)
             elif floor_tracks and state.detection_kind != "FALL_TRANSITION":
                 state.confidence = max(track["metrics"]["confidence"] for track in floor_tracks)
                 state.detection_kind = "PERSON_ON_FLOOR"
                 if len(floor_tracks) == 1:
-                    state.person = person_geometry(poses, floor_tracks[0]["pose_index"], width, height)
+                    track = floor_tracks[0]
+                    metrics = track["metrics"]
+                    state.person = person_geometry(poses, track["pose_index"], width, height,
+                                                   metrics["depth_joints"])
+                    state.visual_review_eligible = metrics["visual_review_eligible"] and state.person is not None
             self.sessions[session] = state
-            return result(state.confidence, state.person, state.detection_kind, state.overlay)
+            return result(state.confidence, state.person, state.detection_kind, state.overlay,
+                          state.visual_review_eligible, state.floor_candidate)
         finally:
             self.inference_lock.release()
 
@@ -274,15 +355,19 @@ class FallService:
                     self.inference_lock.release()
 
 
-def result(confidence, person=None, detection_kind=None, overlay=None):
+def result(confidence, person=None, detection_kind=None, overlay=None, visual_review_eligible=False, floor_candidate=None):
     value = {"suspected_fall": confidence is not None, "confidence": confidence, "algorithm": ALGORITHM}
     if confidence is not None:
         value["detection_kind"] = detection_kind or "FALL_TRANSITION"
         value["ground_confirmation_required"] = detection_kind == "PERSON_ON_FLOOR"
+        if detection_kind == "PERSON_ON_FLOOR":
+            value["visual_review_eligible"] = visual_review_eligible
     if person is not None:
         value["person"] = person
     if overlay is not None:
         value["overlay"] = overlay
+    if floor_candidate is not None and confidence is None:
+        value["floor_candidate"] = floor_candidate
     return value
 
 
@@ -306,7 +391,9 @@ def frame_context(headers, now=None):
     except (ValueError, OverflowError):
         raise FrameError("INVALID_FALL_CAPTURE_TIME") from None
     now = datetime.now(timezone.utc).timestamp() if now is None else now
-    if not math.isfinite(captured_at) or not -.5 <= now - captured_at <= 2.:
+    # Capture order and inter-frame gaps are checked within the camera stream.
+    # The wall-clock check is only a bound on skew or a queued old frame.
+    if not math.isfinite(captured_at) or not -2. <= now - captured_at <= 5.:
         raise FrameError("FALL_CAPTURE_TIME_NOT_FRESH")
     return captured_at, moving == "true"
 
@@ -320,6 +407,7 @@ async def lifespan(app):
     app.state.service = FallService(PoseModel(path))
     app.state.authorization = "Bearer " + token
     app.state.receiving = asyncio.Lock()
+    app.state.last_frame_rejection = {}
     cleanup = asyncio.create_task(app.state.service.expire())
     try:
         yield
@@ -329,6 +417,16 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+def frame_rejected(error):
+    code = str(error)
+    now = time.monotonic()
+    last = app.state.last_frame_rejection
+    if now - last.get(code, -math.inf) >= 15:
+        LOGGER.warning("FALL_FRAME_REJECTED code=%s", code)
+        last[code] = now
+    return HTTPException(422, code)
 
 
 @app.get("/health")
@@ -351,7 +449,7 @@ async def frame(request: Request):
     try:
         captured_at, camera_moving = frame_context(request.headers)
     except FrameError as error:
-        raise HTTPException(422, str(error)) from None
+        raise frame_rejected(error) from None
     if app.state.receiving.locked():
         raise HTTPException(429, "FALL_BUSY")
     async with app.state.receiving:
@@ -372,5 +470,5 @@ async def frame(request: Request):
             value = await run_in_threadpool(app.state.service.observe, session, raw, time.monotonic(),
                                            captured_at, camera_moving)
         except FrameError as error:
-            raise HTTPException(422, str(error)) from None
+            raise frame_rejected(error) from None
     return JSONResponse(value, headers={"Cache-Control": "no-store"})

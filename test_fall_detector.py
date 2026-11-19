@@ -284,12 +284,128 @@ def test_overlay_floor_state_matches_existing_fall_suspicion_and_clears():
         value = service.observe('floor', jpeg, 10.+index*.25, 1000.+index*.25)
     assert value['suspected_fall'] is True and value['detection_kind'] == 'PERSON_ON_FLOOR'
     assert value['ground_confirmation_required'] is True
+    assert value['visual_review_eligible'] is True
     assert value['overlay']['detections'][0]['state'] == 'PERSON_ON_FLOOR'
     assert len(value['person']['keypoints']) == 2
     model.present = False
     empty = service.observe('floor', jpeg, 13.25, 1003.25)
     assert empty['overlay']['detections'] == [] and empty['suspected_fall'] is False
     print('  [PASS] Overlay floor state matches the existing depth-confirmation-required suspicion contract')
+
+
+def test_transition_does_not_remain_latched_without_the_person():
+    from io import BytesIO
+    from PIL import Image
+    from fall_service import FallService, frame_context
+
+    class Model:
+        index = 0
+        def poses(self, frame):
+            t = self.index / 20.
+            self.index += 1
+            if t >= 2.:
+                return []
+            progress = min(1., max(0., (t - 1.) / .4))
+            return [create_pose(.45 + .33 * progress, 5. + 75. * progress)]
+
+    service = FallService(Model())
+    with BytesIO() as stream, Image.new('RGB', (320, 240)) as frame:
+        frame.save(stream, format='JPEG')
+        jpeg = stream.getvalue()
+    answers = [service.observe('transition', jpeg, 10.+index*.05, 1000.+index*.05) for index in range(42)]
+    assert any(answer.get('detection_kind') == 'FALL_TRANSITION' for answer in answers[:40])
+    assert answers[-1]['suspected_fall'] is False
+    assert frame_context({'X-Fall-Captured-At': '1970-01-01T00:16:40Z'}, now=1003.3) == (1000., False)
+    print('  [PASS] Stale transition clears when the person leaves, small clock skew keeps ordered frames')
+
+
+def test_cropped_bent_leg_tracks_same_person_and_requires_depth():
+    from io import BytesIO
+    from PIL import Image
+    from fall_service import FallService, PoseBatch
+
+    class Model:
+        index = 0
+
+        def poses(self, frame):
+            pose = [{"x": .5, "y": .5, "visibility": 0.} for _ in range(33)]
+            landmarks = {23: (.3, .75), 25: (.5, .75), 27: (.47, .80)}
+            if self.index == 0:
+                landmarks[24] = (.32, .78)
+            elif self.index >= 12:
+                # A seated person's shin descends vertically from the knee.
+                landmarks[27] = (.5, .96)
+            for joint, (x, y) in landmarks.items():
+                pose[joint] = {"x": x, "y": y, "visibility": .9}
+            self.index += 1
+            batch = PoseBatch()
+            batch.append(pose)
+            batch.detections = [{"pose_index": 0, "bbox": [.15, .65, .6, .32], "confidence": .9}]
+            return batch
+
+    service = FallService(Model())
+    with BytesIO() as stream, Image.new('RGB', (640, 480)) as frame:
+        frame.save(stream, format='JPEG')
+        jpeg = stream.getvalue()
+    values = [service.observe('cropped', jpeg, 10.+i*.25, 1000.+i*.25) for i in range(24)]
+    assert all(value["overlay"]["detections"][0]["track_id"] == 1 for value in values)
+    assert not any(value["suspected_fall"] for value in values[:8])
+    assert values[8]["detection_kind"] == "PERSON_ON_FLOOR"
+    assert values[8]["ground_confirmation_required"] is True
+    assert values[8]["visual_review_eligible"] is False
+    assert values[8]["person"]["keypoints"] == [{"x": .3, "y": .75}, {"x": .5, "y": .75}]
+    assert not any(value["suspected_fall"] for value in values[12:])
+    print('  [PASS] Cropped bent-leg track stays identified, requires depth, and rejects a seated shin')
+
+
+def test_static_floor_timer_survives_a_change_of_observable_body_model():
+    detector = FallDetector(allow_partial=True)
+    events = []
+    for i in range(12):
+        pose = create_pose(.75, 80.)
+        if i % 2:
+            pose[12]['visibility'] = 0.
+        state, metrics, triggered = detector.update(pose, 640, 480, i*.25)
+        if triggered:
+            events.append((i*.25, metrics))
+    assert len(events) == 1 and events[0][0] == 2.
+    assert events[0][1]['detection_kind'] == 'PERSON_ON_FLOOR'
+
+
+def test_end_on_body_is_a_depth_candidate_only_and_never_an_rgb_fall():
+    from io import BytesIO
+    from PIL import Image
+    from fall_service import FallService, PoseBatch
+
+    class Model:
+        missing = False
+        def poses(self, frame):
+            batch = PoseBatch()
+            if self.missing:
+                return batch
+            pose = [{"x": .5, "y": .5, "visibility": 0.} for _ in range(33)]
+            # Closed legs point along the camera axis: vertically aligned in RGB.
+            for joint, point in {23:(.47,.55),24:(.51,.55),25:(.48,.72),27:(.49,.92)}.items():
+                pose[joint] = dict(x=point[0],y=point[1],visibility=.95)
+            batch.append(pose)
+            batch.detections = [dict(pose_index=0,bbox=[.4,.5,.2,.49],confidence=.9)]
+            return batch
+
+    model = Model();service = FallService(model)
+    with BytesIO() as stream, Image.new('RGB',(640,480)) as frame:
+        frame.save(stream,format='JPEG');jpeg=stream.getvalue()
+    results = [service.observe('end-on',jpeg,10+i*.25,1000+i*.25) for i in range(10)]
+    assert not any(r['suspected_fall'] for r in results)
+    assert not any('floor_candidate' in r for r in results[:8])
+    candidate = results[8]['floor_candidate']
+    assert candidate['person']['keypoint_roles'] == ['hip','ankle']
+    assert candidate['ground_confirmation_required'] and not candidate['visual_review_eligible']
+    model.missing=True
+    assert 'floor_candidate' not in service.observe('end-on',jpeg,13.,1003.)
+    model.missing=False
+    assert 'floor_candidate' not in service.observe('end-on',jpeg,13.25,1003.25)
+    moving = [service.observe('moving-end-on',jpeg,20+i*.25,2000+i*.25,True) for i in range(10)]
+    assert not any('floor_candidate' in r or r['suspected_fall'] for r in moving)
 
 
 if __name__ == "__main__":
@@ -305,4 +421,8 @@ if __name__ == "__main__":
     test_overlay_uses_one_pose_inference_and_keeps_partial_people_boxes()
     test_overlay_cache_keeps_capture_time_and_new_empty_frame_clears_boxes()
     test_overlay_floor_state_matches_existing_fall_suspicion_and_clears()
-    print("=== ALL 11 FALL DETECTION / OVERLAY TEST SCENARIOS PASSED ===")
+    test_transition_does_not_remain_latched_without_the_person()
+    test_cropped_bent_leg_tracks_same_person_and_requires_depth()
+    test_static_floor_timer_survives_a_change_of_observable_body_model()
+    test_end_on_body_is_a_depth_candidate_only_and_never_an_rgb_fall()
+    print("=== ALL 15 FALL DETECTION / OVERLAY TEST SCENARIOS PASSED ===")

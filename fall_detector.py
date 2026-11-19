@@ -16,6 +16,8 @@ import os
 HIP_JOINTS = (23, 24)
 TORSO_JOINTS = (11, 12) + HIP_JOINTS
 BODY_JOINTS = TORSO_JOINTS + (25, 26, 27, 28)
+BODY_SIDES = ((11, 23, 25, 27), (12, 24, 26, 28))
+PARTIAL_BODY_MODELS = ('SIDE_TORSO', 'THIGH')
 
 
 def visible_image_point(point):
@@ -36,37 +38,76 @@ def visible_image_point(point):
     return x, y
 
 
-def observed_body_axis(points, width, height):
-    """Use the torso when visible, otherwise a visible extended lower leg."""
+def visible_hips(points):
+    return {i: point for i in HIP_JOINTS if i < len(points)
+            and (point := visible_image_point(points[i])) is not None}
+
+
+def center_point(points):
+    return tuple(sum(values) / len(values) for values in zip(*points))
+
+
+def observed_body_axis(points, width, height, allow_partial=False):
+    """Find an observable axis and a pair of keypoints for depth verification."""
     visible = {i: visible_image_point(points[i]) for i in BODY_JOINTS if i < len(points)}
-    if any(visible.get(i) is None for i in HIP_JOINTS):
+    hips_by_joint = {i: visible[i] for i in HIP_JOINTS if visible.get(i) is not None}
+    if not hips_by_joint or len(hips_by_joint) < 2 and not allow_partial:
         return None
-    hips = tuple((visible[23][axis] + visible[24][axis]) / 2 for axis in (0, 1))
-    if all(visible.get(i) is not None for i in (11, 12)):
+    hips = center_point(hips_by_joint.values())
+    if len(hips_by_joint) == 2 and all(visible.get(i) is not None for i in (11, 12)):
         shoulders = tuple((visible[11][axis] + visible[12][axis]) / 2 for axis in (0, 1))
-        return visible, hips, shoulders, 'TORSO'
+        return visible, hips, shoulders, 'TORSO', HIP_JOINTS
+    if allow_partial:
+        side_torsos = []
+        for shoulder, hip, _, _ in BODY_SIDES:
+            a, b = visible.get(hip), visible.get(shoulder)
+            if a is not None and b is not None:
+                length = math.hypot((b[0]-a[0])*width, (b[1]-a[1])*height)
+                if length >= 10.:
+                    side_torsos.append((length, hip, shoulder))
+        if side_torsos:
+            _, hip, shoulder = max(side_torsos)
+            a, b = visible[hip], visible[shoulder]
+            depth_joints = HIP_JOINTS if len(hips_by_joint) == 2 else (hip, shoulder)
+            return visible, hips, (hips[0]+b[0]-a[0], hips[1]+b[1]-a[1]), 'SIDE_TORSO', depth_joints
     legs = []
-    for hip, knee, ankle in ((23, 25, 27), (24, 26, 28)):
-        if any(visible.get(i) is None for i in (hip, knee, ankle)):
+    thighs = []
+    for _, hip, knee, ankle in BODY_SIDES:
+        a, b, c = (visible.get(i) for i in (hip, knee, ankle))
+        if a is None or b is None:
             continue
-        a, b, c = (visible[i] for i in (hip, knee, ankle))
         upper = ((a[0] - b[0]) * width, (a[1] - b[1]) * height)
-        lower = ((c[0] - b[0]) * width, (c[1] - b[1]) * height)
-        lengths = math.hypot(*upper), math.hypot(*lower)
-        if min(lengths) < 10:
+        upper_length = math.hypot(*upper)
+        if upper_length < 10.:
             continue
-        cosine = sum(u * v for u, v in zip(upper, lower)) / (lengths[0] * lengths[1])
+        if c is None:
+            if allow_partial:
+                thighs.append((upper_length, hip, knee))
+            continue
+        lower = ((c[0] - b[0]) * width, (c[1] - b[1]) * height)
+        lower_length = math.hypot(*lower)
+        if lower_length < 10.:
+            continue
+        cosine = sum(u * v for u, v in zip(upper, lower)) / (upper_length * lower_length)
         knee_angle = math.degrees(math.acos(max(-1., min(1., cosine))))
-        if knee_angle >= 145.:
+        if knee_angle >= 145. and len(hips_by_joint) == 2:
             legs.append((a, c))
-    if not legs:
-        return None
-    hip, ankle = max(legs, key=lambda p: math.hypot((p[0][0]-p[1][0])*width, (p[0][1]-p[1][1])*height))
-    return visible, hips, (hips[0] + ankle[0] - hip[0], hips[1] + ankle[1] - hip[1]), 'LOWER_BODY'
+        elif allow_partial and abs(lower[1]) <= .5 * upper_length:
+            # A vertical shin below a horizontal thigh is consistent with sitting.
+            thighs.append((upper_length, hip, knee))
+    if legs:
+        hip, ankle = max(legs, key=lambda p: math.hypot((p[0][0]-p[1][0])*width, (p[0][1]-p[1][1])*height))
+        return visible, hips, (hips[0]+ankle[0]-hip[0], hips[1]+ankle[1]-hip[1]), 'LOWER_BODY', HIP_JOINTS
+    if thighs:
+        _, hip, knee = max(thighs)
+        a, b = visible[hip], visible[knee]
+        return visible, hips, (hips[0]+b[0]-a[0], hips[1]+b[1]-a[1]), 'THIGH', (hip, knee)
+    return None
 
 
 class FallDetector:
-    def __init__(self):
+    def __init__(self, allow_partial=False):
+        self.allow_partial = allow_partial
         self.angle_threshold = float(os.getenv("FALL_ANGLE_THRESHOLD", "50.0"))
         self.speed_threshold = float(os.getenv("FALL_SPEED_THRESHOLD", "0.20"))
         self.confirm_seconds = float(os.getenv("FALL_CONFIRM_SEC", "0.5"))
@@ -103,16 +144,17 @@ class FallDetector:
         self.floor_reported = False
 
     def update(self, points, width, height, now, allow_transition=True):
-        body = observed_body_axis(points, width, height)
+        body = observed_body_axis(points, width, height, self.allow_partial)
         if body is None:
             self.reset_pose()
-            hips = [visible_image_point(points[i]) if i < len(points) else None for i in HIP_JOINTS]
-            if all(point is not None for point in hips):
+            hips = visible_hips(points)
+            if len(hips) == 2:
                 # Preserve the starting hip position when a close camera crops
                 # the shoulders/feet. This alone cannot confirm a horizontal body.
-                self.prev = (now, (hips[0][1] + hips[1][1]) / 2, None, 'HIP_ONLY')
+                self.prev = (now, center_point(hips.values())[1], None, 'HIP_ONLY', False)
             return "LOW_VISIBILITY", {}, False
-        visible, (hip_x, hip_y), (axis_x, axis_y), body_model = body
+        visible, (hip_x, hip_y), (axis_x, axis_y), body_model, depth_joints = body
+        partial = body_model in PARTIAL_BODY_MODELS
 
         # Góc thân người (torso angle) so với phương thẳng đứng (0 = đứng thẳng, 90 = nằm ngang)
         dx = (axis_x - hip_x) * width
@@ -130,9 +172,9 @@ class FallDetector:
         angular_speed = 0.0
 
         if self.prev is not None:
-            old_t, old_hip_y, old_angle, old_model = self.prev
+            old_t, old_hip_y, old_angle, old_model, old_partial = self.prev
             dt = now - old_t
-            if dt <= 0. or dt > 1. or old_model != body_model:
+            if dt <= 0. or dt > 1.:
                 self.floor_since, self.floor_model = None, None
 
             if .015 < dt <= 1.:
@@ -146,21 +188,21 @@ class FallDetector:
                 rapid_drop = hip_speed > self.speed_threshold
                 rapid_rotation = angular_speed > 85.0 and hip_speed > 0.05
 
-                if allow_transition and (rapid_drop or rapid_rotation):
+                if allow_transition and not partial and not old_partial and (rapid_drop or rapid_rotation):
                     self.motion_until = now + 1.8
                     self.peak_speed = max(self.peak_speed, hip_speed)
 
-        if not allow_transition:
+        if not allow_transition or partial:
             # Image displacement is not patient motion while the camera moves.
             self.motion_until = 0.0
             self.candidate_since = None
             self.peak_speed = 0.0
 
-        self.prev = (now, hip_y, angle, body_model)
+        self.prev = (now, hip_y, angle, body_model, partial)
 
         # Tiêu chí tư thế ngang: góc >= ngưỡng HOẶC tỷ lệ khung bao ngang >= 0.95
         is_horizontal = (angle >= self.angle_threshold) or (aspect_ratio >= 0.95 and angle >= 40.0)
-        if body_model == 'LOWER_BODY':
+        if body_model == 'LOWER_BODY' or partial:
             is_horizontal = angle >= max(65., self.angle_threshold)
 
         # Tiêu chí độ cao thấp: hông ở nửa dưới khung hình (gần mặt sàn)
@@ -205,8 +247,11 @@ class FallDetector:
         floor_posture = (self.floor_enabled and angle >= self.floor_angle_threshold
                          and hip_y > self.floor_min_hip_y)
         if floor_posture:
-            if self.floor_since is None or self.floor_model != body_model:
-                self.floor_since, self.floor_model = now, body_model
+            # A shoulder/hip confidence flicker changes the observable axis,
+            # not the identity of this continuous low horizontal person. Only
+            # static posture shares its timer; fall kinetics remain model-bound.
+            if self.floor_since is None:self.floor_since = now
+            self.floor_model = body_model
             floor_ready = now - self.floor_since >= self.floor_confirm_seconds
             if floor_ready and not self.floor_reported and now >= self.cooldown_until:
                 suspected = True
@@ -235,6 +280,8 @@ class FallDetector:
             "torso_angle_deg": round(angle, 2) if body_model == 'TORSO' else None,
             "body_axis_angle_deg": round(angle, 2),
             "body_model": body_model,
+            "depth_joints": depth_joints,
+            "visual_review_eligible": not partial and allow_transition,
             "hip_y_normalized": round(hip_y, 4),
             "hip_speed_normalized_per_sec": round(hip_speed, 3),
             "angular_speed_deg_per_sec": round(angular_speed, 2),
@@ -251,41 +298,46 @@ class FallDetector:
 class MultiPersonFallTracker:
     """Theo dõi và phát hiện té ngã độc lập cho từng người trong khung hình (Multi-person)."""
 
-    def __init__(self, max_distance=0.35, timeout_sec=2.0):
+    def __init__(self, max_distance=0.35, timeout_sec=2.0, allow_partial=False):
         self.max_dist = max_distance
         self.timeout = timeout_sec
+        self.allow_partial = allow_partial
         self.tracks = {}
         self.next_person_id = 1
 
     def update(self, all_poses, width, height, now, allow_transition=True):
-        indexed_poses = [(index, pose) for index, pose in enumerate(all_poses) if all(
-            i < len(pose) and visible_image_point(pose[i]) is not None for i in HIP_JOINTS)]
-        original_indices = [index for index, _ in indexed_poses]
-        all_poses = [pose for _, pose in indexed_poses]
+        min_hips = 1 if self.allow_partial else 2
+        indexed_poses = [(index, pose, hips) for index, pose in enumerate(all_poses)
+                         if len(hips := visible_hips(pose)) >= min_hips]
+        original_indices = [index for index, _, _ in indexed_poses]
+        all_poses = [pose for _, pose, _ in indexed_poses]
         if not all_poses:
             to_del = [tid for tid, t in self.tracks.items() if now - t["seen"] > self.timeout]
             for tid in to_del:
                 del self.tracks[tid]
             return [], "NO_PERSON", False, None
 
-        centers = []
-        for pose in all_poses:
-            def _get(p):
-                if isinstance(p, dict):
-                    return float(p.get("x", 0.5)), float(p.get("y", 0.5))
-                return float(p.x), float(p.y)
-            p23_x, p23_y = _get(pose[23]) if len(pose) > 23 else (0.5, 0.5)
-            p24_x, p24_y = _get(pose[24]) if len(pose) > 24 else (0.5, 0.5)
-            centers.append(((p23_x + p24_x) / 2.0, (p23_y + p24_y) / 2.0))
+        hips = [points for _, _, points in indexed_poses]
+        centers = [center_point(points.values()) for points in hips]
 
         assigned = {}
         unassigned_poses = set(range(len(all_poses)))
 
         for tid, t in list(self.tracks.items()):
+            if now - t["seen"] > self.timeout:
+                del self.tracks[tid]
+                continue
             best_idx = None
             best_d = self.max_dist
             for i in unassigned_poses:
                 d = math.hypot(centers[i][0] - t["pos"][0], centers[i][1] - t["pos"][1])
+                if self.allow_partial and (len(hips[i]) == 1 or len(t["hips"]) == 1):
+                    shared = hips[i].keys() & t["hips"].keys()
+                    if not shared:
+                        continue
+                    # With a cropped hip, compare the same joints, not a shifted midpoint.
+                    d = math.dist(center_point([hips[i][j] for j in shared]),
+                                  center_point([t["hips"][j] for j in shared]))
                 if d < best_d:
                     best_d = d
                     best_idx = i
@@ -293,16 +345,16 @@ class MultiPersonFallTracker:
                 assigned[tid] = best_idx
                 unassigned_poses.remove(best_idx)
                 self.tracks[tid]["pos"] = centers[best_idx]
+                self.tracks[tid]["hips"] = hips[best_idx]
                 self.tracks[tid]["seen"] = now
-            elif now - t["seen"] > self.timeout:
-                del self.tracks[tid]
 
         for i in unassigned_poses:
             tid = self.next_person_id
             self.next_person_id += 1
             self.tracks[tid] = {
-                "detector": FallDetector(),
+                "detector": FallDetector(allow_partial=self.allow_partial),
                 "pos": centers[i],
+                "hips": hips[i],
                 "seen": now,
                 "person_id": tid
             }
