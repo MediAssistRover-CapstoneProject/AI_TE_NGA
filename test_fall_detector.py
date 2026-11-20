@@ -408,6 +408,20 @@ def test_end_on_body_is_a_depth_candidate_only_and_never_an_rgb_fall():
     assert not any('floor_candidate' in r or r['suspected_fall'] for r in moving)
 
 
+def test_shared_ground_anchors_keep_identity_and_reject_occlusion():
+    from fall_service import PoseBatch, ground_people_result
+    batch=PoseBatch();batch.append(create_pose(.5,0.))
+    batch.detections=[dict(pose_index=0,bbox=[.2,.1,.6,.85],confidence=.9)]
+    tracks=[dict(pose_index=0,person_id=7,state='CHECKING')]
+    people=ground_people_result(batch,tracks,640,480)
+    assert len(people)==1 and people[0]['track_id']==7
+    assert people[0]['keypoint_roles']==['ankle','ankle']
+    batch[0][28]['visibility']=.1
+    assert ground_people_result(batch,tracks,640,480)==[]
+    batch[0][28]['visibility']=.99;tracks[0]['state']='AMBIGUOUS_PERSON'
+    assert ground_people_result(batch,tracks,640,480)==[]
+
+
 if __name__ == "__main__":
     print("=== RUNNING FALL DETECTOR V2 VALIDATION SUITE ===")
     test_positive_fall()
@@ -425,4 +439,5 @@ if __name__ == "__main__":
     test_cropped_bent_leg_tracks_same_person_and_requires_depth()
     test_static_floor_timer_survives_a_change_of_observable_body_model()
     test_end_on_body_is_a_depth_candidate_only_and_never_an_rgb_fall()
-    print("=== ALL 15 FALL DETECTION / OVERLAY TEST SCENARIOS PASSED ===")
+    test_shared_ground_anchors_keep_identity_and_reject_occlusion()
+    print("=== ALL 16 FALL DETECTION / SHARED POSE TEST SCENARIOS PASSED ===")

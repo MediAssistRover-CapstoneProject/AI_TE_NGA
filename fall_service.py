@@ -146,6 +146,7 @@ class Observation:
     overlay: dict | None = None
     floor_candidates: dict = field(default_factory=dict)
     floor_candidate: dict | None = None
+    ground_people: list = field(default_factory=list)
 
 
 def overlay_result(poses, tracks, width, height, captured_at, moving):
@@ -204,6 +205,33 @@ def person_geometry(poses, pose_index, width, height, depth_joints):
     return {"image_width": width, "image_height": height, "bbox": box,
             "keypoint_roles": [roles.get(joint, 'body') for joint in depth_joints],
             "keypoints": [{"x": x, "y": y} for x, y in points]}
+
+
+def ground_people_result(poses, tracks, width, height):
+    """Reuse this inference's reliable, isolated feet for RGB-D zone projection.
+
+    A box bottom is not a measured foot. Missing/occluded ankles therefore do
+    not become ground anchors, and ambiguous neighbouring people stay unknown.
+    """
+    people = []
+    confidence_by_pose = {item['pose_index']: item['confidence']
+                          for item in getattr(poses, 'detections', [])}
+    for track in tracks[:8]:
+        index = track['pose_index']
+        if track['state'] == 'AMBIGUOUS_PERSON':
+            continue
+        pose = poses[index]
+        if any(len(pose) <= joint or pose[joint].get('visibility', 0.) < .65 for joint in (27, 28)):
+            continue
+        geometry = person_geometry(poses, index, width, height, (27, 28))
+        if geometry is None:
+            continue
+        confidence = min(confidence_by_pose.get(index, 0.),
+                         *(pose[joint]['visibility'] for joint in (27, 28)))
+        if confidence < .5:
+            continue
+        people.append({**geometry, 'track_id': track['person_id'], 'confidence': float(confidence)})
+    return people
 
 
 def depth_floor_candidate(state, poses, tracks, width, height, now, moving):
@@ -278,7 +306,7 @@ class FallService:
                     and state.camera_moving == camera_moving
                     and (not capture_timed or sample_at == state.sample_at)):
                 return result(state.confidence, state.person, state.detection_kind, state.overlay,
-                              state.visual_review_eligible, state.floor_candidate)
+                              state.visual_review_eligible, state.floor_candidate, state.ground_people)
             if (state is not None and capture_timed and state.capture_timed
                     and sample_at <= state.sample_at):
                 raise FrameError("FALL_FRAME_OUT_OF_ORDER")
@@ -295,6 +323,7 @@ class FallService:
             tracks, _, _, _ = state.tracker.update(poses, width, height, sample_at,
                                                  allow_transition=not camera_moving)
             state.overlay = overlay_result(poses, tracks, width, height, captured_at, camera_moving)
+            state.ground_people = ground_people_result(poses, tracks, width, height)
             state.floor_candidate = depth_floor_candidate(state, poses, tracks, width, height, sample_at, camera_moving)
             triggers = [track for track in tracks if track["triggered"]]
             # A track missing from this frame cannot complete a prior transition.
@@ -341,7 +370,7 @@ class FallService:
                     state.visual_review_eligible = metrics["visual_review_eligible"] and state.person is not None
             self.sessions[session] = state
             return result(state.confidence, state.person, state.detection_kind, state.overlay,
-                          state.visual_review_eligible, state.floor_candidate)
+                          state.visual_review_eligible, state.floor_candidate, state.ground_people)
         finally:
             self.inference_lock.release()
 
@@ -355,8 +384,10 @@ class FallService:
                     self.inference_lock.release()
 
 
-def result(confidence, person=None, detection_kind=None, overlay=None, visual_review_eligible=False, floor_candidate=None):
+def result(confidence, person=None, detection_kind=None, overlay=None, visual_review_eligible=False, floor_candidate=None,
+           ground_people=None):
     value = {"suspected_fall": confidence is not None, "confidence": confidence, "algorithm": ALGORITHM}
+    value.update(ground_people_version=1, ground_people=ground_people or [])
     if confidence is not None:
         value["detection_kind"] = detection_kind or "FALL_TRANSITION"
         value["ground_confirmation_required"] = detection_kind == "PERSON_ON_FLOOR"
@@ -432,7 +463,7 @@ def frame_rejected(error):
 @app.get("/health")
 @app.get("/v1/fall/health")
 def health():
-    return {"state": "READY", "algorithm": ALGORITHM}
+    return {"state": "READY", "algorithm": ALGORITHM, "ground_people_version": 1}
 
 
 @app.post("/v1/fall/frame")
