@@ -26,6 +26,26 @@ Pi báo sự kiện cho BE. Nút SOS hoạt động theo luồng SOS của BE.
   hông vẫn có khung nhưng không được suy ra đã đủ dữ liệu để xác định ngã.
   Metadata không tự tạo cảnh báo và không thay đổi điều kiện xác minh depth.
   Timestamp thuộc ảnh đầu vào; không dùng thời điểm trả HTTP thay thời điểm chụp.
+- Service công bố `observation_candidate_version: 1`. Một người có tư thế thấp,
+  ngang và track tách biệt duy trì `FALL_OBSERVATION_CONFIRM_SEC` (mặc định
+  `1.0`, cho phép `0.5–2.0` giây) có thể tạo `observation_candidate`. Kết quả
+  này dùng chung lần inference với khung người, té ngã và restricted zone;
+  không tạo `suspected_fall` và không gọi BE trực tiếp. Pi chuyển một yêu cầu
+  quan sát tới BE để tạm ngưng tuần tra theo luồng xác nhận dừng vật lý, rồi
+  mới quan sát tĩnh và xác minh depth/TF. Yêu cầu dừng sớm không cần chờ
+  `LOCALIZED` hoặc depth. Robot đang di chuyển vẫn có thể tạo ứng viên tư thế
+  ngang; vận tốc người từ camera đang chuyển động vẫn bị vô hiệu hóa.
+- `observation_candidate` gồm `version`, `track_id`, `tracking_revision`,
+  `reason`, `phase`, `continuous_duration_sec`, `body_axis_angle_deg`, `hip_y`,
+  `body_model`, `bbox` và `visual_quality`. `reason` là
+  `LOW_HORIZONTAL_POSTURE`, `PARTIAL_LOW_HORIZONTAL_POSTURE` hoặc
+  `END_ON_LOWER_BODY`; ứng viên cuối vẫn dùng cửa sổ tĩnh dài hơn của nhánh
+  hướng chân vào camera và có góc RGB `null`. `tracking_revision` đổi khi
+  tracker được đặt lại; không dùng `track_id` đơn lẻ để chống gửi trùng qua
+  các lần chuyển động/dừng. Mất người, nhập nhằng hoặc phục hồi tư thế sẽ xóa
+  ứng viên. Chỉ trả tối đa một ứng viên điều khiển mỗi ảnh, không cộng thời
+  gian khi gửi lại cùng ảnh/timestamp và không dùng confidence YOLO làm xác
+  suất té ngã.
 - WebRTC vẽ các khung này ở trình duyệt qua data channel `mar.ai.overlay.v1`.
   Pi cần bản `patrol_fall.py`, `media_runtime.py`, `media_bridge.py` có overlay;
   không chạy thêm model hoặc encode lại video trên Pi. Vẽ khung người không
@@ -35,6 +55,10 @@ Pi báo sự kiện cho BE. Nút SOS hoạt động theo luồng SOS của BE.
   thứ tự. `x`, `y` được chuẩn hóa về `[0, 1)` trên ảnh JPEG Pi đã gửi. Pi dùng
   đúng ảnh depth thẳng hàng với khung đó. Khi hông không rõ hoặc người khác ở
   gần và có thể bị nhầm, kết quả vẫn báo nghi té ngã nhưng bỏ trường `person`.
+  Khi xác định được đúng một người kích hoạt, `person.track_id` và
+  `person.tracking_revision` gắn sự kiện với đúng người đó; không lấy ID của
+  một `observation_candidate` khác làm ID cho cảnh báo. `floor_candidate.person`
+  cũng giữ cặp định danh này khi Pi xác minh người nằm bằng depth.
 - Nhánh `PERSON_ON_FLOOR` quan sát người đã nằm trước khi robot đi tới: tư thế
   ngang, hông thấp trên ảnh và cùng một track phải duy trì mặc định 2 giây.
   Đây là nghi vấn từ RGB, chưa khẳng định người ở trên sàn. Phản hồi có

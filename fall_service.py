@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import threading
 import time
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -147,6 +147,9 @@ class Observation:
     floor_candidates: dict = field(default_factory=dict)
     floor_candidate: dict | None = None
     ground_people: list = field(default_factory=list)
+    observation_tracks: dict = field(default_factory=dict)
+    observation_candidate: dict | None = None
+    tracking_revision: str = field(default_factory=lambda: str(uuid4()))
 
 
 def overlay_result(poses, tracks, width, height, captured_at, moving):
@@ -275,14 +278,103 @@ def depth_floor_candidate(state, poses, tracks, width, height, now, moving):
         if detector.floor_enabled and now-since >= detector.floor_confirm_seconds:
             ready.append({'reason': 'END_ON_LOWER_BODY', 'confidence': .55, 'track_id': tid,
                           'ground_confirmation_required': True, 'visual_review_eligible': False,
-                          'person': person})
+                          'person': {**person, 'track_id': tid, 'tracking_revision': state.tracking_revision}})
     state.floor_candidates = current
     return ready[0] if len(ready) == 1 else None
 
 
+def early_observation_candidate(state, poses, tracks, width, height, now, confirm_seconds):
+    """Request a bounded look at one isolated person, without declaring a fall.
+
+    This reuses the current pose inference. Image motion is deliberately not
+    treated as a fall velocity: low horizontal posture can request a stop even
+    while the robot moves, but depth/stationary review still decides an alert.
+    """
+    detections = {item['pose_index']: item for item in getattr(poses, 'detections', [])
+                  if item.get('pose_index') is not None}
+    current, ready = {}, []
+    for track in tracks:
+        metrics = track['metrics']
+        index, tid = track['pose_index'], track['person_id']
+        detection = detections.get(index)
+        if track['state'] == 'AMBIGUOUS_PERSON' or detection is None:
+            continue
+        angle, hip_y = metrics.get('body_axis_angle_deg'), metrics.get('hip_y_normalized')
+        body_model = metrics.get('body_model')
+        detector = state.tracker.tracks[tid]['detector']
+        partial = body_model in ('SIDE_TORSO', 'THIGH')
+        horizontal = (isinstance(angle, (int, float)) and
+                      (angle >= max(65., detector.angle_threshold)
+                       if partial or body_model == 'LOWER_BODY' else
+                       angle >= detector.angle_threshold or
+                       metrics.get('aspect_ratio', 0.) >= .95 and angle >= 40.))
+        if (not horizontal or not isinstance(hip_y, (int, float)) or hip_y <= .45
+                or detection['confidence'] < .4):
+            continue
+        geometry = person_geometry(poses, index, width, height, metrics['depth_joints'])
+        if geometry is None:
+            continue
+        reason = 'PARTIAL_LOW_HORIZONTAL_POSTURE' if partial else 'LOW_HORIZONTAL_POSTURE'
+        prior, center = state.observation_tracks.get(tid), track['center']
+        continuous = (prior is not None and prior['reason'] == reason
+                      and 0. < now - prior['last'] <= MAX_FRAME_GAP_SECONDS
+                      and math.dist(center, prior['center']) <= .15)
+        since = prior['since'] if continuous else now
+        current[tid] = {'since': since, 'last': now, 'center': center, 'reason': reason}
+        duration = now - since
+        if duration + 1e-9 < confirm_seconds:
+            continue
+        qualities = [float(poses[index][joint].get('visibility', 1.)) for joint in BODY_JOINTS
+                     if joint < len(poses[index]) and visible_image_point(poses[index][joint]) is not None]
+        ready.append({'version': 1, 'track_id': tid, 'tracking_revision': state.tracking_revision, 'reason': reason,
+                      'phase': 'OBSERVATION_CANDIDATE',
+                      'continuous_duration_sec': round(duration, 3),
+                      'body_axis_angle_deg': angle, 'hip_y': hip_y, 'body_model': body_model,
+                      'bbox': geometry['bbox'],
+                      'visual_quality': {'person_confidence': detection['confidence'],
+                                         'min_keypoint_confidence': min(qualities),
+                                         'ground_confirmation_required': True}})
+    # An end-on leg view cannot establish a horizontal axis from RGB. Retain
+    # the existing longer, stationary-only candidate gate rather than causing
+    # every pair of standing legs to pause a moving robot.
+    end_on = state.floor_candidate
+    if end_on is not None and end_on['track_id'] not in current:
+        tid = end_on['track_id']
+        prior = state.floor_candidates.get(tid)
+        track = next((item for item in tracks if item['person_id'] == tid), None)
+        if prior is not None and track is not None:
+            index = track['pose_index']
+            detection = detections.get(index)
+            if detection is not None and detection['confidence'] >= .4:
+                hips = visible_hips(poses[index])
+                ready.append({'version': 1, 'track_id': tid, 'tracking_revision': state.tracking_revision,
+                              'reason': 'END_ON_LOWER_BODY',
+                              'phase': 'OBSERVATION_CANDIDATE',
+                              'continuous_duration_sec': round(now-prior['since'], 3),
+                              'body_axis_angle_deg': None, 'hip_y': center_point(hips.values())[1],
+                              'body_model': 'END_ON_LOWER_BODY', 'bbox': end_on['person']['bbox'],
+                              'visual_quality': {'person_confidence': detection['confidence'],
+                                                 'min_keypoint_confidence': min(float(poses[index][joint].get('visibility', 1.))
+                                                     for joint in BODY_JOINTS if joint < len(poses[index])
+                                                     and visible_image_point(poses[index][joint]) is not None),
+                                                 'ground_confirmation_required': True}})
+    state.observation_tracks = current
+    # Only one control candidate crosses the link. Boxes for other people still
+    # share the same inference and remain available through normal metadata.
+    ready.sort(key=lambda item: (item['reason'] != 'LOW_HORIZONTAL_POSTURE',
+                                 -item['continuous_duration_sec'], item['track_id']))
+    return ready[0] if ready else None
+
+
 class FallService:
-    def __init__(self, model):
+    def __init__(self, model, observation_confirm_seconds=None):
         self.model = model
+        self.observation_confirm_seconds = (float(os.getenv('FALL_OBSERVATION_CONFIRM_SEC', '1.0'))
+                                            if observation_confirm_seconds is None else observation_confirm_seconds)
+        if (not isinstance(self.observation_confirm_seconds, (int, float))
+                or not math.isfinite(self.observation_confirm_seconds)
+                or not .5 <= self.observation_confirm_seconds <= 2.):
+            raise ValueError('FALL_OBSERVATION_CONFIRM_SEC must be between 0.5 and 2.0')
         self.sessions = {}
         self.inference_lock = threading.Lock()
 
@@ -306,7 +398,8 @@ class FallService:
                     and state.camera_moving == camera_moving
                     and (not capture_timed or sample_at == state.sample_at)):
                 return result(state.confidence, state.person, state.detection_kind, state.overlay,
-                              state.visual_review_eligible, state.floor_candidate, state.ground_people)
+                              state.visual_review_eligible, state.floor_candidate, state.ground_people,
+                              state.observation_candidate)
             if (state is not None and capture_timed and state.capture_timed
                     and sample_at <= state.sample_at):
                 raise FrameError("FALL_FRAME_OUT_OF_ORDER")
@@ -325,6 +418,8 @@ class FallService:
             state.overlay = overlay_result(poses, tracks, width, height, captured_at, camera_moving)
             state.ground_people = ground_people_result(poses, tracks, width, height)
             state.floor_candidate = depth_floor_candidate(state, poses, tracks, width, height, sample_at, camera_moving)
+            state.observation_candidate = early_observation_candidate(
+                state, poses, tracks, width, height, sample_at, self.observation_confirm_seconds)
             triggers = [track for track in tracks if track["triggered"]]
             # A track missing from this frame cannot complete a prior transition.
             for track in state.tracker.tracks.values():
@@ -355,6 +450,8 @@ class FallService:
                     metrics = trigger["metrics"]
                     state.person = person_geometry(poses, trigger["pose_index"], width, height,
                                                    metrics["depth_joints"])
+                    if state.person is not None:
+                        state.person.update(track_id=trigger['person_id'], tracking_revision=state.tracking_revision)
                     state.visual_review_eligible = metrics["visual_review_eligible"] and state.person is not None
                     LOGGER.warning("FALL_RGB_SUSPICION kind=%s track_id=%d body_model=%s depth_points=%s "
                                    "visual_review_eligible=%s", state.detection_kind, trigger["person_id"],
@@ -367,10 +464,13 @@ class FallService:
                     metrics = track["metrics"]
                     state.person = person_geometry(poses, track["pose_index"], width, height,
                                                    metrics["depth_joints"])
+                    if state.person is not None:
+                        state.person.update(track_id=track['person_id'], tracking_revision=state.tracking_revision)
                     state.visual_review_eligible = metrics["visual_review_eligible"] and state.person is not None
             self.sessions[session] = state
             return result(state.confidence, state.person, state.detection_kind, state.overlay,
-                          state.visual_review_eligible, state.floor_candidate, state.ground_people)
+                          state.visual_review_eligible, state.floor_candidate, state.ground_people,
+                          state.observation_candidate)
         finally:
             self.inference_lock.release()
 
@@ -385,9 +485,12 @@ class FallService:
 
 
 def result(confidence, person=None, detection_kind=None, overlay=None, visual_review_eligible=False, floor_candidate=None,
-           ground_people=None):
+           ground_people=None, observation_candidate=None):
     value = {"suspected_fall": confidence is not None, "confidence": confidence, "algorithm": ALGORITHM}
     value.update(ground_people_version=1, ground_people=ground_people or [])
+    value['observation_candidate_version'] = 1
+    if observation_candidate is not None:
+        value['observation_candidate'] = observation_candidate
     if confidence is not None:
         value["detection_kind"] = detection_kind or "FALL_TRANSITION"
         value["ground_confirmation_required"] = detection_kind == "PERSON_ON_FLOOR"
@@ -463,7 +566,8 @@ def frame_rejected(error):
 @app.get("/health")
 @app.get("/v1/fall/health")
 def health():
-    return {"state": "READY", "algorithm": ALGORITHM, "ground_people_version": 1}
+    return {"state": "READY", "algorithm": ALGORITHM, "ground_people_version": 1,
+            "observation_candidate_version": 1}
 
 
 @app.post("/v1/fall/frame")
