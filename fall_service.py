@@ -315,12 +315,14 @@ def early_observation_candidate(state, poses, tracks, width, height, now, confir
         if geometry is None:
             continue
         reason = 'PARTIAL_LOW_HORIZONTAL_POSTURE' if partial else 'LOW_HORIZONTAL_POSTURE'
-        prior, center = state.observation_tracks.get(tid), track['center']
-        continuous = (prior is not None and prior['reason'] == reason
-                      and 0. < now - prior['last'] <= MAX_FRAME_GAP_SECONDS
-                      and math.dist(center, prior['center']) <= .15)
+        prior = state.observation_tracks.get(tid)
+        # The tracker already checks identity using shared hips and excludes
+        # ambiguous people. Body visibility can change as the robot turns.
+        continuous = prior is not None and 0. < now - prior['last'] <= MAX_FRAME_GAP_SECONDS
         since = prior['since'] if continuous else now
-        current[tid] = {'since': since, 'last': now, 'center': center, 'reason': reason}
+        if track['state'] == 'SUSPECTED_PERSON_ON_FLOOR' and detector.floor_since is not None:
+            since = min(since, detector.floor_since)
+        current[tid] = {'since': since, 'last': now}
         duration = now - since
         if duration + 1e-9 < confirm_seconds:
             continue
@@ -409,17 +411,33 @@ class FallService:
                 poses = self.model.poses(frame)
             if (state is None or received_at - state.received_at > MAX_FRAME_GAP_SECONDS
                     or state.frame_size != (width, height) or state.capture_timed != capture_timed
-                    or state.camera_moving != camera_moving or sample_at - state.sample_at > MAX_FRAME_GAP_SECONDS):
+                    or sample_at - state.sample_at > MAX_FRAME_GAP_SECONDS):
                 state = Observation(MultiPersonFallTracker(max_distance=.25, allow_partial=True),
                                     received_at, (width, height),
                                     sample_at=sample_at, capture_timed=capture_timed, camera_moving=camera_moving)
+            if state.camera_moving != camera_moving:
+                # Keep continuity for the early hold, but require new evidence
+                # for a fall alert after the change in camera motion.
+                for track in state.tracker.tracks.values():
+                    track['detector'].reset_pose()
+                state.floor_candidates.clear()
+                state.confidence = state.detection_kind = None
+                state.camera_moving = camera_moving
             tracks, _, _, _ = state.tracker.update(poses, width, height, sample_at,
                                                  allow_transition=not camera_moving)
             state.overlay = overlay_result(poses, tracks, width, height, captured_at, camera_moving)
+            state.overlay['tracking_revision'] = state.tracking_revision
             state.ground_people = ground_people_result(poses, tracks, width, height)
             state.floor_candidate = depth_floor_candidate(state, poses, tracks, width, height, sample_at, camera_moving)
-            state.observation_candidate = early_observation_candidate(
+            previous = state.observation_candidate
+            candidate = early_observation_candidate(
                 state, poses, tracks, width, height, sample_at, self.observation_confirm_seconds)
+            state.observation_candidate = candidate
+            if candidate is not None and (
+                    previous is None or candidate['track_id'] != previous['track_id']):
+                LOGGER.info('FALL_OBSERVATION_CANDIDATE track_id=%d revision=%s reason=%s duration_sec=%.3f moving=%s',
+                            candidate['track_id'], candidate['tracking_revision'], candidate['reason'],
+                            candidate['continuous_duration_sec'], camera_moving)
             triggers = [track for track in tracks if track["triggered"]]
             # A track missing from this frame cannot complete a prior transition.
             for track in state.tracker.tracks.values():
